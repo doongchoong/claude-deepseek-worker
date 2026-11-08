@@ -9,7 +9,7 @@ import type { Balance, Usage } from '../types'
 // (curl은 macOS, Linux, Windows 10 이상에 기본으로 들어 있다).
 
 type Args = Record<string, unknown>
-type EnvName = 'HOME' | 'USERPROFILE' | 'SystemRoot' | 'DEEPSEEK_API_KEY' | 'DEEPSEEK_BASE_URL' | 'DEEPSEEK_MODEL'
+type EnvName = 'HOME' | 'USERPROFILE' | 'SystemRoot' | 'DEEPSEEK_BASE_URL' | 'DEEPSEEK_MODEL'
 
 // 엔진($)은 훅 안에서만 쓸 수 있어서, 도구 구현에는 필요한 기능만 묶어 넘긴다
 type IO = {
@@ -143,15 +143,16 @@ async function checkedPath(io: IO, cfg: Config, p: string) {
   )
 }
 
-// 키는 플러그인 옵션 → 환경변수 DEEPSEEK_API_KEY → ~/.config/deepseek/api_key 순서로 찾는다
+// 키는 플러그인 옵션(보안 저장소) → ~/.config/deepseek/api_key 순서로 찾는다.
+// 환경변수는 모든 자식 프로세스에 물려주고 env로 쉽게 드러나므로 키를 받지 않는다
 async function loadConfig(io: IO, optionKey: string, allowOutside: boolean): Promise<Config> {
   const home = await homeDir(io)
-  let key = optionKey.trim() || ((await io.env('DEEPSEEK_API_KEY')) ?? '').trim()
+  let key = optionKey.trim()
   const keyFile = `${configDir(home)}/api_key`
   if (!key && (await io.exists(keyFile))) key = (await io.read(keyFile)).trim()
   if (!key) {
     throw new Error(
-      `DeepSeek API 키가 없습니다. /plugin 에서 ${PLUGIN} 옵션에 넣거나, DEEPSEEK_API_KEY를 설정하거나, ${keyFile}에 저장하세요.`,
+      `DeepSeek API 키가 없습니다. /plugin 에서 ${PLUGIN} 옵션(api_key)에 넣거나, 본인만 읽을 수 있게 ${keyFile}에 저장하세요.`,
     )
   }
   return {
@@ -817,8 +818,6 @@ export const register: Register = (on, options) => {
             return $.env.get('USERPROFILE')
           case 'SystemRoot':
             return $.env.get('SystemRoot')
-          case 'DEEPSEEK_API_KEY':
-            return $.env.get('DEEPSEEK_API_KEY')
           case 'DEEPSEEK_BASE_URL':
             return $.env.get('DEEPSEEK_BASE_URL')
           case 'DEEPSEEK_MODEL':

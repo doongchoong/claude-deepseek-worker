@@ -65,7 +65,7 @@ claude plugin install deepseek-worker --marketplace doongchoong/claude-deepseek-
 
 `/plugin`이 동작하지 않는 데스크톱 앱에서는 프롬프트 입력창 옆 **+** → **Plugins** → **Add marketplace**에 `doongchoong/claude-deepseek-worker` 입력 → **Add plugin** 순서로 설치해요.
 
-플러그인 옵션을 비워 두면 환경변수 `DEEPSEEK_API_KEY`, 그다음 `~/.config/deepseek/api_key` 파일 순서로 키를 찾아요.
+플러그인 옵션을 비워 두면 `~/.config/deepseek/api_key` 파일에서 키를 읽어요(윈도우는 `%USERPROFILE%\.config\deepseek\api_key`). 이 파일은 본인만 읽을 수 있게 해 두세요(macOS/Linux는 `chmod 600`). 환경변수로는 키를 받지 않아요. 셸에서 띄운 모든 프로그램이 환경변수를 물려받고, `env` 한 번이면 그대로 드러나기 때문이에요.
 
 ## 사용법
 
@@ -82,7 +82,6 @@ Claude에게 평소처럼 말하면 돼요. 직접 쓰는 것보다 맡기는 �
 
 | 환경변수 | 기본값 | |
 | --- | --- | --- |
-| `DEEPSEEK_API_KEY` | — | 플러그인 옵션에 키를 넣지 않았을 때 쓰는 API 키 |
 | `DEEPSEEK_MODEL` | `deepseek-flash` | 기본 모델 |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API 주소 |
 

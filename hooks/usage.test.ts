@@ -6,9 +6,10 @@ const BATCH = 'mcp__deepseek-worker__deepseek_batch'
 type Reply = { content: string; finish?: string; usage?: Record<string, unknown> }
 
 // DeepSeek API, 파일, 환경변수를 메모리로 흉내 낸다
-function world(on: any, replies: Reply[], opts: { balances?: string[]; disabled?: boolean } = {}) {
+function world(on: any, replies: Reply[], opts: { balances?: string[]; disabled?: boolean; keyFile?: boolean } = {}) {
   const sent: any[] = []
   const argv0: string[] = []
+  const auths: string[] = []
   const written: Record<string, string> = {}
   const statuses: (string | undefined)[] = []
   const balances = opts.balances ?? ['4.38']
@@ -22,10 +23,12 @@ function world(on: any, replies: Reply[], opts: { balances?: string[]; disabled?
     return { value: undefined }
   })
   on('env.get', (_: unknown, e: any) => ({
-    value: ({ HOME: '/home/u', DEEPSEEK_API_KEY: 'test-key' } as Record<string, string>)[e.name],
+    // DEEPSEEK_API_KEY가 있어도 플러그인은 읽지 않아야 한다
+    value: ({ HOME: '/home/u', DEEPSEEK_API_KEY: 'env-key' } as Record<string, string>)[e.name],
   }))
-  // 디스크: 작업 폴더 /work, 그 안의 a.py, 바깥의 /etc/passwd, 그리고 OS의 curl
+  // 디스크: 작업 폴더 /work, 그 안의 a.py, 바깥의 /etc/passwd, OS의 curl, 그리고 키 파일
   const disk = new Set(['/', '/work', '/work/a.py', '/etc', '/etc/passwd', '/usr/bin/curl'])
+  if (opts.keyFile !== false) disk.add('/home/u/.config/deepseek/api_key')
   on('session.cwd', () => ({ value: '/work' }))
   on('fs.exists', (_: unknown, e: any) => ({
     value: disk.has(e.path) || (!!opts.disabled && e.path.endsWith('/disabled')),
@@ -49,6 +52,7 @@ function world(on: any, replies: Reply[], opts: { balances?: string[]; disabled?
   // 생성은 curl 스트리밍으로 온다: 표준 입력의 curl 설정에서 본문을 꺼내고 SSE 조각으로 답한다
   on('process.spawn', async function* (_: unknown, e: any) {
     argv0.push(e.argv[0])
+    auths.push(e.input.split('\n').find((l: string) => l.includes('Authorization')) ?? '')
     const line = e.input.split('\n').find((l: string) => l.startsWith('data-binary = '))
     const body = JSON.parse(JSON.parse(line.slice('data-binary = '.length)))
     sent.push(body)
@@ -66,7 +70,7 @@ function world(on: any, replies: Reply[], opts: { balances?: string[]; disabled?
     }
     return { value: { code: 0, signal: null } }
   })
-  return { sent, written, statuses, argv0 }
+  return { sent, written, statuses, argv0, auths }
 }
 
 const start = ($: any) => $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
@@ -159,4 +163,31 @@ test('allow_outside_workdir를 켜면 작업 폴더 밖 파일도 읽는다', { 
   await $.tool.call({ tool: CHAT, prompt: 'x', files: ['/etc/passwd'] })
 
   expect(w.sent.length).toBe(1)
+})
+
+test('키는 환경변수에서 읽지 않는다: 옵션도 키 파일도 없으면 거절한다', async ($, on) => {
+  const w = world(on, [{ content: 'x' }], { keyFile: false })
+  await start($)
+  const r: any = await $.tool.call({ tool: CHAT, prompt: 'x' })
+
+  expect(String(r.deny ?? r.text)).toContain('DeepSeek API 키가 없습니다')
+  expect(String(r.deny ?? r.text)).not.toContain('DEEPSEEK_API_KEY')
+  expect(w.sent.length).toBe(0)
+})
+
+test('플러그인 옵션의 키가 키 파일보다 먼저 쓰인다', { options: { api_key: 'option-key' } }, async ($, on) => {
+  const w = world(on, [{ content: 'x' }], { keyFile: false })
+  await start($)
+  await $.tool.call({ tool: CHAT, prompt: 'x' })
+
+  expect(w.auths[0]).toContain('Bearer option-key')
+})
+
+test('옵션이 비어 있으면 키 파일의 키를 쓰고, 환경변수의 키는 쓰지 않는다', async ($, on) => {
+  const w = world(on, [{ content: 'x' }])
+  await start($)
+  await $.tool.call({ tool: CHAT, prompt: 'x' })
+
+  expect(w.auths[0]).toContain('Bearer FILE BODY')
+  expect(w.auths[0]).not.toContain('env-key')
 })

@@ -65,7 +65,7 @@ claude plugin install deepseek-worker --marketplace doongchoong/claude-deepseek-
 
 In the desktop app, where `/plugin` does not run: click **+** next to the prompt box → **Plugins** → **Add marketplace** with `doongchoong/claude-deepseek-worker` → **Add plugin**.
 
-The key can also come from the `DEEPSEEK_API_KEY` environment variable or a file at `~/.config/deepseek/api_key` (checked in that order when the plugin option is empty).
+If the plugin option is empty, the key is read from `~/.config/deepseek/api_key` (on Windows, `%USERPROFILE%\.config\deepseek\api_key`). Make that file readable only by you (`chmod 600` on macOS/Linux). The key is never read from an environment variable: every program started from your shell inherits environment variables, and a plain `env` prints them.
 
 ## Using it
 
@@ -82,7 +82,6 @@ Claude reviews what comes back (runs the tests, reads parts of the file). After 
 
 | Variable | Default | |
 | --- | --- | --- |
-| `DEEPSEEK_API_KEY` | — | API key, if not set in the plugin option |
 | `DEEPSEEK_MODEL` | `deepseek-flash` | Default model |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API endpoint |
 
