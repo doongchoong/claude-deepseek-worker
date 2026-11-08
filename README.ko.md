@@ -23,7 +23,7 @@ Claude에게 저렴한 워커 **DeepSeek**을 붙여 주는 Claude Code 플러�
 | `deepseek_research` | DeepSeek이 직접 여러 번 웹을 검색하고 페이지를 읽은 뒤, 출처가 달린 정리만 돌려줘요. |
 | `deepseek_models` | 쓸 수 있는 모델 목록을 보여줘요. |
 | 상태 줄 | `deepseek-worker 7회 128.5Ktok hit 62% $4.38`처럼 이 세션의 호출 수, 토큰, 캐시 적중률, 계정 잔액을 보여줘요. |
-| `/deepseek-usage` | 이 세션의 사용량을 자세히 보여줘요. 캐시된 입력과 안 된 입력, 출력, 추론 토큰, 사용한 금액이 나와요. |
+| `/deepseek-usage` | 이 세션의 사용량을 자세히 보여줘요. 캐시된 입력과 안 된 입력, 출력, 추론 토큰, 사용한 금액이 나와요. 아직 호출 전이면 키가 맞는지 확인하고 잔액을 보여줘요(무료). |
 | Claude용 지침 | 언제 맡기고 언제 직접 할지, DeepSeek 캐시를 잘 맞추는 방법을 Claude의 시스템 프롬프트에 넣어 줘요. |
 
 워커가 내 파일을 쓰는 만큼 안전장치도 넣었어요.
@@ -102,6 +102,8 @@ types/index.d.ts                 사용량 상태의 형태
 ```
 
 도구는 Claude Code 플러그인 API(`$.tool.register`)로 등록하고, DeepSeek 호출은 `$.http.fetch`, 파일 읽기·쓰기는 `$.fs`로 해요.
+
+**변경을 내보낼 때:** 푸시할 때마다 `.claude-plugin/plugin.json`의 `version`을 올리세요. 설치본이 버전별로 캐시되기 때문에, 같은 버전으로 푸시한 변경은 이미 설치한 사람에게 전달되지 않을 수 있어요. 설치한 사람은 `claude plugin update deepseek-worker@claude-deepseek-worker`로 받아요.
 
 ## 라이선스
 

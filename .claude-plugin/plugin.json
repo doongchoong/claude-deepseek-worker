@@ -1,6 +1,6 @@
 {
   "name": "deepseek-worker",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Let Claude hand off well-specified coding and web research to DeepSeek as a cheap worker, with token and balance usage in the status line.",
   "author": { "name": "doongchoong" },
   "homepage": "https://github.com/doongchoong/claude-deepseek-worker",

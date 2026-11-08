@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { HttpInit, Register } from 'claude-code'
+import type { EngineInterface, HttpInit, Register } from 'claude-code'
 
 import type { Balance, Usage } from '../types'
 
@@ -145,8 +145,7 @@ async function checkedPath(io: IO, cfg: Config, p: string) {
 
 // 키는 플러그인 옵션(보안 저장소) → ~/.config/deepseek/api_key 순서로 찾는다.
 // 환경변수는 모든 자식 프로세스에 물려주고 env로 쉽게 드러나므로 키를 받지 않는다
-async function loadConfig(io: IO, optionKey: string, allowOutside: boolean): Promise<Config> {
-  const home = await homeDir(io)
+async function findKey(io: IO, optionKey: string, home: string) {
   let key = optionKey.trim()
   const keyFile = `${configDir(home)}/api_key`
   if (!key && (await io.exists(keyFile))) key = (await io.read(keyFile)).trim()
@@ -155,9 +154,16 @@ async function loadConfig(io: IO, optionKey: string, allowOutside: boolean): Pro
       `DeepSeek API 키가 없습니다. /plugin 에서 ${PLUGIN} 옵션(api_key)에 넣거나, 본인만 읽을 수 있게 ${keyFile}에 저장하세요.`,
     )
   }
+  return key
+}
+
+const baseUrlOf = async (io: IO) => ((await io.env('DEEPSEEK_BASE_URL')) || DEFAULT_BASE_URL).replace(/\/+$/, '')
+
+async function loadConfig(io: IO, optionKey: string, allowOutside: boolean): Promise<Config> {
+  const home = await homeDir(io)
   return {
-    key,
-    baseUrl: ((await io.env('DEEPSEEK_BASE_URL')) || DEFAULT_BASE_URL).replace(/\/+$/, ''),
+    key: await findKey(io, optionKey, home),
+    baseUrl: await baseUrlOf(io),
     model: (await io.env('DEEPSEEK_MODEL')) || DEFAULT_MODEL,
     home,
     curl: await curlPath(io),
@@ -358,7 +364,7 @@ async function balanceOf(io: IO, cfg: Config): Promise<{ currency: string; total
 
 async function saveOutput(io: IO, cfg: Config, content: string, outputPath: string) {
   const m = FENCE_RE.exec(content)
-  if (m) content = m[1]
+  if (m?.[1] !== undefined) content = m[1]
   if (!content.endsWith('\n')) content += '\n'
   const path = await checkedPath(io, cfg, outputPath)
   await io.write(path, content)
@@ -411,6 +417,7 @@ type Bal = { currency: string; total: number }
 
 function addUsage(t: Usage, used: Used[]): Usage {
   const last = used[used.length - 1]
+  if (!last) return t
   let n = { ...t, lastIn: last.t.in, lastOut: last.t.out, model: last.model }
   for (const { t: x } of used) {
     n = {
@@ -432,6 +439,20 @@ const nextBalance = (prev: Balance, bal: Bal): Balance =>
   prev && prev.currency === bal.currency
     ? { ...prev, now: bal.total }
     : { currency: bal.currency, start: bal.total, now: bal.total }
+
+// /deepseek-usage를 호출 전에 쓰면 그 자리에서 잔액을 조회해 키가 맞는지 알려 준다 (잔액 조회는 무료)
+async function keyCheckText(io: IO, optionKey: string) {
+  const head = '이 세션에서는 아직 DeepSeek를 호출하지 않았어요.'
+  const home = await homeDir(io)
+  if (await io.exists(disabledFile(home))) return `${head}\nDeepSeek는 꺼져 있어요(${disabledFile(home)}를 지우면 다시 켜져요).`
+  try {
+    const cfg = { key: await findKey(io, optionKey, home), baseUrl: await baseUrlOf(io) } as Config
+    const b = (await api(io, cfg, '/user/balance')).balance_infos?.[0]
+    return `${head}\n키 정상${b ? `, 계정 잔액 ${money(b.currency, Number(b.total_balance))}` : ''}`
+  } catch (err) {
+    return `${head}\n키 확인 실패: ${(err as Error).message}`
+  }
+}
 
 // 호출 하나가 끝나면 사용량을 더하고, 잔액을 조회해 결과 텍스트 끝에 붙인다
 async function finish(io: IO, cfg: Config, text: string, used: Used[]) {
@@ -467,6 +488,13 @@ async function chat(io: IO, cfg: Config, a: Args) {
   return finish(io, cfg, t ? `${saved}\n${t}` : saved, r.usage ? [{ model: r.model, t: r.usage }] : [])
 }
 
+// 동시 실행 수: 숫자가 아니면 기본 8, 1~16으로 자른다 (curl 프로세스가 한꺼번에 너무 많이 뜨지 않게)
+const MAX_CONCURRENCY = 16
+const concurrencyOf = (v: unknown) => {
+  const n = Math.floor(Number(v ?? 8))
+  return Number.isFinite(n) ? Math.max(1, Math.min(MAX_CONCURRENCY, n)) : 8
+}
+
 // n개씩 동시에 실행하고 결과는 입력 순서대로
 async function pool<T>(n: number, jobs: (() => Promise<T>)[]): Promise<T[]> {
   const out = new Array<T>(jobs.length)
@@ -474,7 +502,7 @@ async function pool<T>(n: number, jobs: (() => Promise<T>)[]): Promise<T[]> {
   const worker = async () => {
     while (next < jobs.length) {
       const i = next++
-      out[i] = await jobs[i]()
+      out[i] = await jobs[i]!()
     }
   }
   await Promise.all(Array.from({ length: Math.max(1, Math.min(n, jobs.length)) }, worker))
@@ -485,7 +513,7 @@ async function batch(io: IO, cfg: Config, a: Args) {
   const prompts = (a.prompts as string[] | undefined) ?? []
   const used: Used[] = []
   const results = await pool(
-    Number(a.concurrency ?? 8),
+    concurrencyOf(a.concurrency),
     prompts.map((p, i) => async () => {
       try {
         const r = await request(io, cfg, { ...a, files: undefined }, { prompt: String(p) })
@@ -723,7 +751,7 @@ ${MODEL_NOTE}`,
       properties: {
         prompts: { type: 'array', items: { type: 'string' } },
         ...COMMON_PROPS,
-        concurrency: { type: 'integer', default: 8 },
+        concurrency: { type: 'integer', default: 8, minimum: 1, maximum: MAX_CONCURRENCY },
       },
       required: ['prompts'],
     },
@@ -760,6 +788,42 @@ ${MODEL_NOTE}
   },
 ]
 
+// 엔진($)에서 도구 구현이 쓰는 기능만 묶는다
+function makeIO($: EngineInterface): IO {
+  return {
+    fetch: (url, init) => $.http.fetch(url, init),
+    read: path => $.fs.read(path),
+    write: (path, text) => $.fs.write(path, text),
+    exists: path => $.fs.exists(path),
+    realPath: path =>
+      $.fs.stat(path, { resolve: true }).then(
+        st => st.realPath ?? path,
+        () => undefined,
+      ),
+    cwd: () => $.session.cwd(),
+    spawn: (argv, input) => $.process.spawn({ argv, input }),
+    env: async name => {
+      switch (name) {
+        case 'HOME':
+          return $.env.get('HOME')
+        case 'USERPROFILE':
+          return $.env.get('USERPROFILE')
+        case 'SystemRoot':
+          return $.env.get('SystemRoot')
+        case 'DEEPSEEK_BASE_URL':
+          return $.env.get('DEEPSEEK_BASE_URL')
+        case 'DEEPSEEK_MODEL':
+          return $.env.get('DEEPSEEK_MODEL')
+      }
+    },
+    record: async (used, bal) => {
+      const u = await update($, totals, prev => addUsage(prev, used))
+      const b = bal ? await update($, balance, prev => nextBalance(prev, bal)) : await read($, balance)
+      $.ui.status(statusText(u, b))
+    },
+  }
+}
+
 export const register: Register = (on, options) => {
   const optionKey = String(options.api_key ?? '')
   const allowOutside = options.allow_outside_workdir === true
@@ -791,45 +855,16 @@ export const register: Register = (on, options) => {
     return { sections: [...r.sections, { id: `${PLUGIN}:guide`, text: GUIDE, scope: 'session' as const }] }
   })
 
-  on('command.run', { command: 'deepseek-usage' }, async $ => ({
-    text: detailText(await read($, totals), await read($, balance)),
-  }))
+  on('command.run', { command: 'deepseek-usage' }, async $ => {
+    const u = await read($, totals)
+    if (u.calls === 0) return { text: await keyCheckText(makeIO($), optionKey) }
+    return { text: detailText(u, await read($, balance)) }
+  })
 
   on('tool.call', { tool: /^mcp__deepseek-worker__deepseek_(chat|batch|research|models)$/ }, async ($, e) => {
     const t = TOOLS.find(x => TOOL(x.name) === e.tool)
     if (!t) return { deny: `알 수 없는 도구: ${e.tool}` }
-    const io: IO = {
-      fetch: (url, init) => $.http.fetch(url, init),
-      read: path => $.fs.read(path),
-      write: (path, text) => $.fs.write(path, text),
-      exists: path => $.fs.exists(path),
-      realPath: path =>
-        $.fs.stat(path, { resolve: true }).then(
-          st => st.realPath ?? path,
-          () => undefined,
-        ),
-      cwd: () => $.session.cwd(),
-      spawn: (argv, input) => $.process.spawn({ argv, input }),
-      env: async name => {
-        switch (name) {
-          case 'HOME':
-            return $.env.get('HOME')
-          case 'USERPROFILE':
-            return $.env.get('USERPROFILE')
-          case 'SystemRoot':
-            return $.env.get('SystemRoot')
-          case 'DEEPSEEK_BASE_URL':
-            return $.env.get('DEEPSEEK_BASE_URL')
-          case 'DEEPSEEK_MODEL':
-            return $.env.get('DEEPSEEK_MODEL')
-        }
-      },
-      record: async (used, bal) => {
-        const u = await update($, totals, prev => addUsage(prev, used))
-        const b = bal ? await update($, balance, prev => nextBalance(prev, bal)) : await read($, balance)
-        $.ui.status(statusText(u, b))
-      },
-    }
+    const io = makeIO($)
     try {
       if (await io.exists(disabledFile(await homeDir(io)))) return { result: DISABLED_MESSAGE }
       const cfg = await loadConfig(io, optionKey, allowOutside)

@@ -23,7 +23,7 @@ You ──▶ Claude (plans, reviews) ──▶ deepseek_chat / batch / research
 | `deepseek_research` | DeepSeek searches and reads the web on its own, several rounds, and returns only a sourced summary. |
 | `deepseek_models` | Lists available models. |
 | Status line | `deepseek-worker 7회 128.5Ktok hit 62% $4.38` — calls (`회`), tokens, cache hit rate and account balance for the session. |
-| `/deepseek-usage` | Detailed usage for the session: cached / uncached input, output, reasoning, balance spent. |
+| `/deepseek-usage` | Detailed usage for the session: cached / uncached input, output, reasoning, balance spent. Before the first call it checks the key and shows the balance (free). |
 | Guidance for Claude | When to delegate and when to do it itself, and how to keep DeepSeek's prompt cache warm — added to Claude's system prompt. |
 
 Safety details that matter when a worker writes your files:
@@ -102,6 +102,8 @@ types/index.d.ts                 the shape of the usage state
 ```
 
 The tools are registered with Claude Code's plugin API (`$.tool.register`) and call DeepSeek through `$.http.fetch`; files are read and written through `$.fs`. The worker's system prompt, the tool descriptions, the status line and `/deepseek-usage` are in Korean; Claude reads them fine whatever language you talk to it in.
+
+**Releasing a change:** bump `version` in `.claude-plugin/plugin.json` with every push. Installs are cached per version, so a change pushed under the same version may never reach people who already installed it. They pick it up with `claude plugin update deepseek-worker@claude-deepseek-worker`.
 
 ## License
 

@@ -6,10 +6,12 @@ const BATCH = 'mcp__deepseek-worker__deepseek_batch'
 type Reply = { content: string; finish?: string; usage?: Record<string, unknown> }
 
 // DeepSeek API, 파일, 환경변수를 메모리로 흉내 낸다
-function world(on: any, replies: Reply[], opts: { balances?: string[]; disabled?: boolean; keyFile?: boolean } = {}) {
+function world(on: any, replies: Reply[], opts: { balances?: string[]; disabled?: boolean; keyFile?: boolean; badKey?: boolean } = {}) {
   const sent: any[] = []
   const argv0: string[] = []
   const auths: string[] = []
+  let running = 0
+  const peak = { n: 0 }
   const written: Record<string, string> = {}
   const statuses: (string | undefined)[] = []
   const balances = opts.balances ?? ['4.38']
@@ -45,6 +47,7 @@ function world(on: any, replies: Reply[], opts: { balances?: string[]; disabled?
   })
   // 짧은 호출(잔액)은 $.http.fetch로 온다
   on('http.fetch', (_: unknown, e: any) => {
+    if (opts.badKey) return { value: { status: 401, ok: false, headers: {}, text: '{"error":{"message":"Authentication Fails"}}' } }
     const total = balances[Math.min(b++, balances.length - 1)]
     const v = { balance_infos: [{ currency: 'USD', total_balance: total }] }
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(v) } }
@@ -52,11 +55,12 @@ function world(on: any, replies: Reply[], opts: { balances?: string[]; disabled?
   // 생성은 curl 스트리밍으로 온다: 표준 입력의 curl 설정에서 본문을 꺼내고 SSE 조각으로 답한다
   on('process.spawn', async function* (_: unknown, e: any) {
     argv0.push(e.argv[0])
+    peak.n = Math.max(peak.n, ++running)
     auths.push(e.input.split('\n').find((l: string) => l.includes('Authorization')) ?? '')
     const line = e.input.split('\n').find((l: string) => l.startsWith('data-binary = '))
     const body = JSON.parse(JSON.parse(line.slice('data-binary = '.length)))
     sent.push(body)
-    const r = replies[(sent.length - 1) % replies.length]
+    const r = replies[(sent.length - 1) % replies.length]!
     const usage = r.usage ?? { prompt_tokens: 100, completion_tokens: 20, prompt_cache_hit_tokens: 50, prompt_cache_miss_tokens: 50 }
     const half = Math.ceil(r.content.length / 2)
     for (const piece of [r.content.slice(0, half), r.content.slice(half)]) {
@@ -68,9 +72,10 @@ function world(on: any, replies: Reply[], opts: { balances?: string[]; disabled?
         `data: ${JSON.stringify({ model: 'deepseek-flash', choices: [{ delta: {}, finish_reason: r.finish ?? 'stop' }] })}\n\n` +
         `data: ${JSON.stringify({ model: 'deepseek-flash', choices: [], usage })}\n\ndata: [DONE]\n\n`,
     }
+    running--
     return { value: { code: 0, signal: null } }
   })
-  return { sent, written, statuses, argv0, auths }
+  return { sent, written, statuses, argv0, auths, peak }
 }
 
 const start = ($: any) => $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
@@ -190,4 +195,40 @@ test('옵션이 비어 있으면 키 파일의 키를 쓰고, 환경변수의 �
 
   expect(w.auths[0]).toContain('Bearer FILE BODY')
   expect(w.auths[0]).not.toContain('env-key')
+})
+
+const usage = async ($: any) => (await $.command.run({ command: 'deepseek-usage', args: '' } as any)).text as string
+
+test('/deepseek-usage: 호출 전이면 잔액을 조회해 키가 정상인지 보여준다', async ($, on) => {
+  const w = world(on, [{ content: 'x' }])
+  await start($)
+
+  expect(await usage($)).toContain('키 정상, 계정 잔액 $4.38')
+  expect(w.sent.length).toBe(0) // 생성 호출은 하지 않는다
+})
+
+test('/deepseek-usage: 키가 없거나 틀리면 그렇다고 알려 준다', async ($, on) => {
+  world(on, [{ content: 'x' }], { keyFile: false })
+  await start($)
+  expect(await usage($)).toContain('DeepSeek API 키가 없습니다')
+})
+
+test('/deepseek-usage: API가 키를 거절하면 HTTP 오류를 보여 준다', async ($, on) => {
+  world(on, [{ content: 'x' }], { badKey: true })
+  await start($)
+  expect(await usage($)).toContain('키 확인 실패: DeepSeek API /user/balance → HTTP 401')
+})
+
+test('batch: concurrency는 1~16으로 자르고, 숫자가 아니면 기본값으로 모두 실행한다', async ($, on) => {
+  const w = world(on, [{ content: 'a' }])
+  await start($)
+  const prompts = Array.from({ length: 20 }, (_, i) => `p${i}`)
+  await $.tool.call({ tool: BATCH, prompts, concurrency: 100 })
+  expect(w.peak.n).toBeGreaterThan(1) // 실제로 동시에 돌았다
+  expect(w.peak.n).toBeLessThanOrEqual(16)
+  expect(w.sent.length).toBe(20)
+
+  const r = await $.tool.call({ tool: BATCH, prompts: ['a', 'b'], concurrency: 'many' } as any)
+  expect(text(r)).toContain('=== #1 ===\na')
+  expect(w.sent.length).toBe(22)
 })
