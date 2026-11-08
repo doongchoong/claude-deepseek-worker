@@ -20,6 +20,8 @@ type IO = {
   // 링크를 따라간 실제 경로. 없는 경로면 undefined
   realPath: (path: string) => Promise<string | undefined>
   cwd: () => Promise<string>
+  // Claude가 이 경로를 Read/Write 도구로 다루면 Claude Code가 뭐라고 판단할지 (대화창 없이 묻기만 한다)
+  check: (tool: 'Read' | 'Write', filePath: string) => Promise<{ decision: string; reason?: string }>
   env: (name: EnvName) => Promise<string | undefined>
   // 명령을 띄워 출력을 조각조각 받는다 (input은 표준 입력으로 들어간다)
   spawn: (argv: string[], input: string) => AsyncIterable<{ stream: 'stdout' | 'stderr'; text: string }>
@@ -99,7 +101,9 @@ async function curlPath(io: IO) {
   return path
 }
 
-// ───────── 작업 폴더 제한: files와 output_path는 세션의 작업 폴더 안에서만 읽고 쓴다 ─────────
+// ───────── 경로 권한: files와 output_path는 Claude가 Read/Write로 다룰 수 있는 곳만 ─────────
+// 경로 규칙을 따로 두지 않고 Claude Code의 권한 판단을 그대로 따른다. 그래서 작업 폴더, 세션의 임시 폴더(scratchpad),
+// /add-dir로 더한 폴더는 되고, 사용자가 deny 규칙으로 막은 파일(예: Read(.env))은 DeepSeek로도 나가지 않는다.
 
 const isAbsolute = (p: string) => p.startsWith('/') || p.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(p)
 
@@ -129,17 +133,33 @@ async function realDir(io: IO, path: string) {
   }
 }
 
-// 작업 폴더 밖이면 거절한다 (플러그인 옵션 allow_outside_workdir로 끌 수 있다). 읽고 쓸 절대 경로를 돌려준다
-async function checkedPath(io: IO, cfg: Config, p: string) {
+// 읽고 쓸 절대 경로를 돌려주고, 안 되는 곳이면 이유와 함께 거절한다.
+// allow → 진행, deny → 거절, ask(사람에게 물어야 하는 곳) → 작업 폴더 안일 때만 진행.
+// 링크면 링크 경로와 링크를 따라간 실제 경로를 둘 다 묻는다: 작업 폴더 안의 링크가 밖의 파일(예: ~/.ssh/id_rsa)이나
+// deny 규칙으로 막은 파일을 가리켜도 새지 않게 한다. 둘 다 allow여야 allow다.
+// 플러그인 옵션 allow_outside_workdir를 켜면 이 확인을 모두 건너뛴다.
+async function checkedPath(io: IO, cfg: Config, p: string, mode: 'read' | 'write') {
   const expanded = expand(cfg, p)
   const abs = isAbsolute(expanded) ? expanded : `${await io.cwd()}/${expanded}`
   if (!cfg.workdir) return abs
+  const verb = mode === 'read' ? '읽을' : '쓸'
   const real = await realDir(io, abs)
+  const asked = real === normalize(abs) ? [abs] : [abs, real]
+  let allAllowed = true
+  for (const x of asked) {
+    const verdict = await io.check(mode === 'read' ? 'Read' : 'Write', x)
+    if (verdict.decision === 'deny') {
+      const what = x === abs ? '' : `(링크가 가리키는 ${x})`
+      throw new Error(`${p}${what}는 Claude Code 권한 설정이 막은 경로라 ${verb} 수 없습니다${verdict.reason ? `: ${verdict.reason}` : '.'}`)
+    }
+    if (verdict.decision !== 'allow') allAllowed = false
+  }
+  if (allAllowed) return abs
   const windows = /^[A-Za-z]:/.test(cfg.workdir)
   const [r, w] = windows ? [real.toLowerCase(), cfg.workdir.toLowerCase()] : [real, cfg.workdir]
   if (r === w || r.startsWith(w.endsWith('/') ? w : `${w}/`)) return abs
   throw new Error(
-    `${p}는 작업 폴더(${cfg.workdir}) 밖이라 읽거나 쓸 수 없습니다. 작업 폴더 안 경로를 쓰거나, /plugin 에서 ${PLUGIN}의 allow_outside_workdir 옵션을 켜세요.`,
+    `${p}${real === normalize(abs) ? '' : `(링크가 가리키는 ${real})`}는 작업 폴더(${cfg.workdir}) 밖이고 Claude Code도 확인 없이 허용하지 않는 경로라 ${verb} 수 없습니다. 작업 폴더나 세션 임시 폴더 안 경로를 쓰거나, /add-dir 로 폴더를 추가하거나, /plugin 에서 ${PLUGIN}의 allow_outside_workdir 옵션을 켜세요.`,
   )
 }
 
@@ -310,7 +330,7 @@ async function buildPrompt(io: IO, cfg: Config, prompt: string, files: unknown) 
   if (!Array.isArray(files) || files.length === 0) return prompt
   const parts: string[] = []
   for (const f of files as string[]) {
-    let text = await io.read(await checkedPath(io, cfg, f))
+    let text = await io.read(await checkedPath(io, cfg, f, 'read'))
     if (text.length > MAX_FILE_CHARS) text = text.slice(0, MAX_FILE_CHARS) + '\n...[truncated]'
     parts.push(`<file path="${f}">\n${text}\n</file>`)
   }
@@ -366,7 +386,7 @@ async function saveOutput(io: IO, cfg: Config, content: string, outputPath: stri
   const m = FENCE_RE.exec(content)
   if (m?.[1] !== undefined) content = m[1]
   if (!content.endsWith('\n')) content += '\n'
-  const path = await checkedPath(io, cfg, outputPath)
+  const path = await checkedPath(io, cfg, outputPath, 'write')
   await io.write(path, content)
   return `saved: ${path} (${content.split('\n').length - 1} lines, ${new TextEncoder().encode(content).length} bytes)`
 }
@@ -471,7 +491,7 @@ async function chat(io: IO, cfg: Config, a: Args) {
     const t = tail(r)
     return finish(io, cfg, t ? `${r.content}\n\n${t}` : r.content, r.usage ? [{ model: r.model, t: r.usage }] : [])
   }
-  await checkedPath(io, cfg, outputPath) // 생성 비용을 쓰기 전에 저장할 수 있는 경로인지 먼저 본다
+  await checkedPath(io, cfg, outputPath, 'write') // 생성 비용을 쓰기 전에 저장할 수 있는 경로인지 먼저 본다
   const r = await request(io, cfg, a, { prompt: prompt + FILE_ONLY_INSTRUCTION, maxTokens: FILE_MAX_TOKENS })
   // 빈 응답이나 미완성 응답이 기존 파일을 덮어쓰지 않도록 한다
   let saved: string
@@ -602,7 +622,7 @@ async function research(io: IO, cfg: Config, a: Args) {
   const model = (a.model as string) || cfg.model
   const maxSearches = Math.max(1, Math.min(20, Number(a.max_searches) || 8))
   const maxFetches = Math.max(1, Math.floor(maxSearches / 2))
-  if (a.output_path) await checkedPath(io, cfg, a.output_path as string)
+  if (a.output_path) await checkedPath(io, cfg, a.output_path as string, 'write')
   const messages: any[] = [
     { role: 'system', content: `${COMMON_SYSTEM}\n\n${RESEARCH_SYSTEM}` },
     { role: 'user', content: question },
@@ -801,6 +821,8 @@ function makeIO($: EngineInterface): IO {
         () => undefined,
       ),
     cwd: () => $.session.cwd(),
+    check: (tool, filePath) =>
+      $.tool.check({ tool, input: tool === 'Write' ? { file_path: filePath, content: '' } : { file_path: filePath } }),
     spawn: (argv, input) => $.process.spawn({ argv, input }),
     env: async name => {
       switch (name) {

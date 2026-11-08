@@ -31,7 +31,7 @@ Safety details that matter when a worker writes your files:
 - **Long outputs don't get cut off silently.** `output_path` calls default to `max_tokens=300000` (reasoning tokens share that budget). If a reply is still truncated it is saved to `<output_path>.partial` and **the original file is left untouched**, with a `[truncated]` line in the result.
 - **An empty reply never overwrites a file.**
 - `reasoning_effort` (`none` · `low` · `high` · `max`) is always sent explicitly; default `high`.
-- **Files stay inside the working folder.** `files` and `output_path` can only read and write inside the session's working folder (links are followed before checking). Turn on the plugin option `allow_outside_workdir` if you need more.
+- **Files follow Claude Code's own permissions.** Before `files` are read or `output_path` is written, the plugin asks Claude Code whether Claude itself could Read / Write that path. Whatever Claude may use — the working folder, the session's scratchpad, folders added with `/add-dir` — works; files you blocked with a deny rule (say `Read(.env)`) are never sent to DeepSeek. A link is checked twice, as itself and as the file it points to, so a link in the working folder can't reach a file outside it or one a deny rule blocks. A path Claude Code would ask about is allowed only inside the working folder. Turn on the plugin option `allow_outside_workdir` to skip these checks.
 
 ## Security notes
 

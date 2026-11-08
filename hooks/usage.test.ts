@@ -29,16 +29,31 @@ function world(on: any, replies: Reply[], opts: { balances?: string[]; disabled?
     value: ({ HOME: '/home/u', DEEPSEEK_API_KEY: 'env-key' } as Record<string, string>)[e.name],
   }))
   // 디스크: 작업 폴더 /work, 그 안의 a.py, 바깥의 /etc/passwd, OS의 curl, 그리고 키 파일
-  const disk = new Set(['/', '/work', '/work/a.py', '/etc', '/etc/passwd', '/usr/bin/curl'])
+  const disk = new Set(['/', '/work', '/work/a.py', '/work/.env', '/etc', '/etc/passwd', '/tmp', '/tmp/scratch', '/tmp/scratch/x.py', '/usr/bin/curl'])
   if (opts.keyFile !== false) disk.add('/home/u/.config/deepseek/api_key')
   on('session.cwd', () => ({ value: '/work' }))
+  // Claude Code의 권한 판단 흉내: 세션 임시 폴더는 허용, .env는 deny 규칙, 작업 폴더 읽기는 허용,
+  // 작업 폴더 쓰기는 기본 모드처럼 ask, 그 밖은 ask
+  const checks: string[] = []
+  on('tool.check', (_: unknown, e: any) => {
+    const path: string = e.input.file_path
+    checks.push(`${e.tool} ${path}`)
+    if (path.startsWith('/tmp/scratch/')) return { decision: 'allow' }
+    if (path.endsWith('/.env')) return { decision: 'deny', reason: 'Read(.env) 규칙', rule: 'Read(.env)' }
+    if (e.tool === 'Read' && path.startsWith('/work/')) return { decision: 'allow' }
+    return { decision: 'ask' }
+  })
   on('fs.exists', (_: unknown, e: any) => ({
     value: disk.has(e.path) || (!!opts.disabled && e.path.endsWith('/disabled')),
   }))
+  // 작업 폴더 안의 링크: 하나는 밖의 비밀 키를, 하나는 deny 규칙으로 막은 .env를 가리킨다
+  const links: Record<string, string> = { '/work/key-link': '/home/u/.ssh/id_rsa', '/work/env-link': '/work/.env' }
   on('fs.stat', (_: unknown, e: any) =>
-    disk.has(e.path)
-      ? { value: { kind: 'file', size: 0, mtimeMs: 0, isLink: false, realPath: e.path } }
-      : { deny: 'ENOENT' },
+    links[e.path]
+      ? { value: { kind: 'file', size: 0, mtimeMs: 0, isLink: true, realPath: links[e.path] } }
+      : disk.has(e.path)
+        ? { value: { kind: 'file', size: 0, mtimeMs: 0, isLink: false, realPath: e.path } }
+        : { deny: 'ENOENT' },
   )
   on('fs.read', () => ({ value: 'FILE BODY' }))
   on('fs.write', (_: unknown, e: any) => {
@@ -75,7 +90,7 @@ function world(on: any, replies: Reply[], opts: { balances?: string[]; disabled?
     running--
     return { value: { code: 0, signal: null } }
   })
-  return { sent, written, statuses, argv0, auths, peak }
+  return { sent, written, statuses, argv0, auths, peak, checks }
 }
 
 const start = ($: any) => $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
@@ -231,4 +246,45 @@ test('batch: concurrency는 1~16으로 자르고, 숫자가 아니면 기본값�
   const r = await $.tool.call({ tool: BATCH, prompts: ['a', 'b'], concurrency: 'many' } as any)
   expect(text(r)).toContain('=== #1 ===\na')
   expect(w.sent.length).toBe(22)
+})
+
+test('Claude Code가 허용하는 세션 임시 폴더는 작업 폴더 밖이어도 읽고 쓴다', async ($, on) => {
+  const w = world(on, [{ content: 'print(1)' }])
+  await start($)
+  const r = await $.tool.call({ tool: CHAT, prompt: 'x', files: ['/tmp/scratch/x.py'], output_path: '/tmp/scratch/out.py' })
+
+  expect(text(r)).toContain('saved: /tmp/scratch/out.py')
+  expect(w.checks).toContain('Read /tmp/scratch/x.py')
+  expect(w.checks).toContain('Write /tmp/scratch/out.py')
+})
+
+test('사용자가 deny 규칙으로 막은 파일은 작업 폴더 안이어도 DeepSeek로 보내지 않는다', async ($, on) => {
+  const w = world(on, [{ content: 'x' }])
+  await start($)
+  const r: any = await $.tool.call({ tool: CHAT, prompt: 'x', files: ['.env'] })
+
+  expect(String(r.deny ?? r.text)).toContain('권한 설정이 막은 경로')
+  expect(String(r.deny ?? r.text)).toContain('Read(.env) 규칙')
+  expect(w.sent.length).toBe(0)
+})
+
+test('ask가 나와도 작업 폴더 안 쓰기는 진행한다 (기본 권한 모드)', async ($, on) => {
+  const w = world(on, [{ content: 'print(1)' }])
+  await start($)
+  await $.tool.call({ tool: CHAT, prompt: 'x', output_path: 'sub/out.py' })
+
+  expect(w.checks).toContain('Write /work/sub/out.py')
+  expect(w.written['out.py']).toBe('print(1)\n')
+})
+
+test('작업 폴더 안의 링크라도 밖의 파일이나 deny 규칙 파일을 가리키면 보내지 않는다', async ($, on) => {
+  const w = world(on, [{ content: 'x' }])
+  await start($)
+  const outside: any = await $.tool.call({ tool: CHAT, prompt: 'x', files: ['key-link'] })
+  const denied: any = await $.tool.call({ tool: CHAT, prompt: 'x', files: ['env-link'] })
+
+  expect(String(outside.deny ?? outside.text)).toContain('링크가 가리키는 /home/u/.ssh/id_rsa')
+  expect(String(denied.deny ?? denied.text)).toContain('권한 설정이 막은 경로')
+  expect(w.checks).toContain('Read /home/u/.ssh/id_rsa') // 링크를 따라간 실제 경로도 물었다
+  expect(w.sent.length).toBe(0)
 })

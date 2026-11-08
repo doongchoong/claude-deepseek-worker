@@ -31,7 +31,7 @@ Claude에게 저렴한 워커 **DeepSeek**을 붙여 주는 Claude Code 플러�
 - **긴 결과가 몰래 잘리지 않아요.** `output_path` 호출은 기본 `max_tokens`가 300000이에요(추론 토큰도 이 예산을 함께 써요). 그래도 잘리면 `<output_path>.partial`로 저장하고 **원래 파일은 그대로 둬요.** 결과에는 `[truncated]` 줄이 붙어요.
 - **빈 응답은 파일을 덮어쓰지 않아요.**
 - `reasoning_effort`(`none` · `low` · `high` · `max`)는 항상 명시해서 보내요. 기본값은 `high`예요.
-- **파일은 작업 폴더 안에서만 다뤄요.** `files`와 `output_path`는 세션의 작업 폴더 안에서만 읽고 쓸 수 있어요(링크는 실제 위치를 따라가서 확인해요). 그 밖의 파일이 필요하면 플러그인 옵션 `allow_outside_workdir`를 켜세요.
+- **파일 권한은 Claude Code를 그대로 따라요.** `files`를 읽거나 `output_path`에 쓰기 전에, Claude 자신이 그 경로를 Read/Write 도구로 다룰 수 있는지 Claude Code에 물어봐요. 그래서 작업 폴더, 세션 임시 폴더(scratchpad), `/add-dir`로 추가한 폴더처럼 Claude가 쓸 수 있는 곳은 다 되고, deny 규칙으로 막아 둔 파일(예: `Read(.env)`)은 DeepSeek으로 보내지 않아요. 링크는 링크 자체와 링크가 가리키는 실제 파일을 둘 다 확인해요. 그래서 작업 폴더 안의 링크로 밖의 파일이나 deny 규칙으로 막은 파일을 읽을 수 없어요. Claude Code가 "확인 필요"로 판단하는 경로는 작업 폴더 안일 때만 허용해요. 이 확인을 건너뛰려면 플러그인 옵션 `allow_outside_workdir`를 켜세요.
 
 ## 보안 참고
 

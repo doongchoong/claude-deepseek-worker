@@ -1,12 +1,19 @@
 {
   "name": "deepseek-worker",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Let Claude hand off well-specified coding and web research to DeepSeek as a cheap worker, with token and balance usage in the status line.",
-  "author": { "name": "doongchoong" },
+  "author": {
+    "name": "doongchoong"
+  },
   "homepage": "https://github.com/doongchoong/claude-deepseek-worker",
   "repository": "https://github.com/doongchoong/claude-deepseek-worker",
   "license": "MIT",
-  "keywords": ["deepseek", "mcp", "worker", "delegation"],
+  "keywords": [
+    "deepseek",
+    "mcp",
+    "worker",
+    "delegation"
+  ],
   "types": "./types/index.d.ts",
   "userConfig": {
     "api_key": {
@@ -18,8 +25,8 @@
     },
     "allow_outside_workdir": {
       "type": "boolean",
-      "title": "Allow files outside the working folder",
-      "description": "Off by default: `files` and `output_path` may only read and write inside the session's working folder.",
+      "title": "Skip the file permission check",
+      "description": "Off by default: `files` and `output_path` may only use paths Claude Code lets Claude Read / Write (working folder, scratchpad, /add-dir folders), and never files a deny rule blocks.",
       "default": false
     }
   }
