@@ -1,0 +1,26 @@
+{
+  "name": "deepseek-worker",
+  "version": "0.1.0",
+  "description": "Let Claude hand off well-specified coding and web research to DeepSeek as a cheap worker, with token and balance usage in the status line.",
+  "author": { "name": "doongchoong" },
+  "homepage": "https://github.com/doongchoong/claude-deepseek-worker",
+  "repository": "https://github.com/doongchoong/claude-deepseek-worker",
+  "license": "MIT",
+  "keywords": ["deepseek", "mcp", "worker", "delegation"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "api_key": {
+      "type": "string",
+      "title": "DeepSeek API key",
+      "description": "Leave empty to use the DEEPSEEK_API_KEY environment variable or ~/.config/deepseek/api_key.",
+      "sensitive": true,
+      "required": false
+    },
+    "allow_outside_workdir": {
+      "type": "boolean",
+      "title": "Allow files outside the working folder",
+      "description": "Off by default: `files` and `output_path` may only read and write inside the session's working folder.",
+      "default": false
+    }
+  }
+}

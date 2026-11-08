@@ -1,0 +1,12 @@
+{
+  "name": "claude-deepseek-worker",
+  "owner": { "name": "doongchoong" },
+  "metadata": { "description": "DeepSeek as a cheap worker for Claude Code." },
+  "plugins": [
+    {
+      "name": "deepseek-worker",
+      "source": "./",
+      "description": "DeepSeek as a cheap worker for Claude: delegated coding, batch jobs and web research, plus a usage status line."
+    }
+  ]
+}
