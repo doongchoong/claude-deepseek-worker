@@ -22,7 +22,7 @@ You ──▶ Claude (plans, reviews) ──▶ deepseek_chat / batch / research
 | `deepseek_batch` | Many independent prompts in parallel, results in order. |
 | `deepseek_research` | DeepSeek searches and reads the web on its own, several rounds, and returns only a sourced summary. |
 | `deepseek_models` | Lists available models. |
-| Status line | `deepseek-worker 7회 128.5Ktok hit 62% $4.38` — calls (`회`), tokens, cache hit rate and account balance for the session. |
+| Status line | `deepseek-worker 7 calls 128.5Ktok hit 62% $4.38` — calls, tokens, cache hit rate and account balance for the session. |
 | `/deepseek-usage` | Detailed usage for the session: cached / uncached input, output, reasoning, balance spent. Before the first call it checks the key and shows the balance (free). |
 | Guidance for Claude | When to delegate and when to do it itself, and how to keep DeepSeek's prompt cache warm — added to Claude's system prompt. |
 
@@ -85,6 +85,8 @@ Claude reviews what comes back (runs the tests, reads parts of the file). After 
 | `DEEPSEEK_MODEL` | `deepseek-flash` | Default model |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API endpoint |
 
+**Language:** the status line and `/deepseek-usage` come in English or Korean. The plugin option `language` is `auto` by default: it follows `LC_ALL` / `LC_MESSAGES` / `LANG`, then the macOS system language, and falls back to English (on Windows set it yourself). Set it to `en` or `ko` in `/plugin` to choose. Everything the models read — tool descriptions, Claude's guidance, DeepSeek's prompts — is English; DeepSeek is told to answer in the language of the request, so a Korean request still gets Korean back.
+
 **Turning it off for a while:** `/plugin disable deepseek-worker`, or create the file `~/.config/deepseek/disabled` (new sessions don't register the tools; running ones answer "disabled"). Delete the file to turn it back on.
 
 ## Cost
@@ -98,10 +100,10 @@ You pay DeepSeek's token prices; web research adds DeepSeek's Search/Fetch price
 .claude-plugin/marketplace.json  makes this repo installable with /plugin install
 hooks/register.ts                the tools, Claude's guidance, status line, /deepseek-usage
 hooks/usage.test.ts              tests with DeepSeek, files and env mocked (claude plugin test .)
-types/index.d.ts                 the shape of the usage state
+types/index.d.ts                 the shape of the plugin's state (usage, balance, language)
 ```
 
-The tools are registered with Claude Code's plugin API (`$.tool.register`) and call DeepSeek through `$.http.fetch`; files are read and written through `$.fs`. The worker's system prompt, the tool descriptions, the status line and `/deepseek-usage` are in Korean; Claude reads them fine whatever language you talk to it in.
+The tools are registered with Claude Code's plugin API (`$.tool.register`) and call DeepSeek through `$.http.fetch`; files are read and written through `$.fs`. Text the models read is English; text people read is English or Korean (see **Language** above).
 
 **Releasing a change:** bump `version` in `.claude-plugin/plugin.json` with every push. Installs are cached per version, so a change pushed under the same version may never reach people who already installed it. They pick it up with `claude plugin update deepseek-worker@claude-deepseek-worker`.
 

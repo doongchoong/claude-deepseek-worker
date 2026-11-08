@@ -22,7 +22,7 @@ Claude에게 저렴한 워커 **DeepSeek**을 붙여 주는 Claude Code 플러�
 | `deepseek_batch` | 서로 독립된 프롬프트 여러 개를 병렬로 처리하고 결과를 순서대로 돌려줘요. |
 | `deepseek_research` | DeepSeek이 직접 여러 번 웹을 검색하고 페이지를 읽은 뒤, 출처가 달린 정리만 돌려줘요. |
 | `deepseek_models` | 쓸 수 있는 모델 목록을 보여줘요. |
-| 상태 줄 | `deepseek-worker 7회 128.5Ktok hit 62% $4.38`처럼 이 세션의 호출 수, 토큰, 캐시 적중률, 계정 잔액을 보여줘요. |
+| 상태 줄 | `deepseek-worker 7회 128.5Ktok hit 62% $4.38`처럼 이 세션의 호출 수, 토큰, 캐시 적중률, 계정 잔액을 보여줘요(영어 설정이면 `7 calls`). |
 | `/deepseek-usage` | 이 세션의 사용량을 자세히 보여줘요. 캐시된 입력과 안 된 입력, 출력, 추론 토큰, 사용한 금액이 나와요. 아직 호출 전이면 키가 맞는지 확인하고 잔액을 보여줘요(무료). |
 | Claude용 지침 | 언제 맡기고 언제 직접 할지, DeepSeek 캐시를 잘 맞추는 방법을 Claude의 시스템 프롬프트에 넣어 줘요. |
 
@@ -85,6 +85,8 @@ Claude에게 평소처럼 말하면 돼요. 직접 쓰는 것보다 맡기는 �
 | `DEEPSEEK_MODEL` | `deepseek-flash` | 기본 모델 |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API 주소 |
 
+**언어:** 상태 줄과 `/deepseek-usage`는 영어나 한국어로 나와요. 플러그인 옵션 `language`의 기본값은 `auto`예요. `LC_ALL`, `LC_MESSAGES`, `LANG`을 먼저 보고, 없으면 macOS 시스템 언어를 따르고, 그래도 모르면 영어로 보여 줘요(윈도우는 직접 지정해 주세요). `/plugin`에서 `en`이나 `ko`로 고정할 수 있어요. 도구 설명, Claude용 지침, DeepSeek 프롬프트처럼 모델이 읽는 글은 모두 영어예요. DeepSeek에는 요청과 같은 언어로 답하라고 지시하므로, 한국어로 맡기면 한국어로 돌아와요.
+
 **잠시 끄기:** `/plugin disable deepseek-worker`를 쓰거나, `~/.config/deepseek/disabled` 파일을 만들면 돼요. 파일을 만든 경우 새 세션에는 도구가 등록되지 않고, 이미 열린 세션에서는 "꺼져 있음"만 답해요. 파일을 지우면 다시 켜져요.
 
 ## 비용
@@ -97,11 +99,11 @@ DeepSeek 토큰 요금만 나가요. 웹 조사는 DeepSeek Search/Fetch 요금�
 .claude-plugin/plugin.json       플러그인 매니페스트와 API 키 옵션
 .claude-plugin/marketplace.json  /plugin install로 설치할 수 있게 해 주는 마켓플레이스 파일
 hooks/register.ts                도구, Claude용 지침, 상태 줄, /deepseek-usage
-hooks/usage.test.ts              DeepSeek·파일·환경변수를 흉내 낸 테스트 (claude plugin test .)
-types/index.d.ts                 사용량 상태의 형태
+hooks/usage.test.ts              DeepSeek·파일·환경변수·권한 판단을 흉내 낸 테스트 (claude plugin test .)
+types/index.d.ts                 플러그인 상태(사용량, 잔액, 언어)의 형태
 ```
 
-도구는 Claude Code 플러그인 API(`$.tool.register`)로 등록하고, DeepSeek 호출은 `$.http.fetch`, 파일 읽기·쓰기는 `$.fs`로 해요.
+도구는 Claude Code 플러그인 API(`$.tool.register`)로 등록하고, DeepSeek 호출은 `$.http.fetch`, 파일 읽기·쓰기는 `$.fs`로 해요. 모델이 읽는 글은 영어, 사람이 보는 글은 영어나 한국어예요(위의 **언어** 참고).
 
 **변경을 내보낼 때:** 푸시할 때마다 `.claude-plugin/plugin.json`의 `version`을 올리세요. 설치본이 버전별로 캐시되기 때문에, 같은 버전으로 푸시한 변경은 이미 설치한 사람에게 전달되지 않을 수 있어요. 설치한 사람은 `claude plugin update deepseek-worker@claude-deepseek-worker`로 받아요.
 

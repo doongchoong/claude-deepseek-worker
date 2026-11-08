@@ -1,4 +1,4 @@
-// 이 세션에서 DeepSeek 워커에 쓴 토큰 합계
+// Tokens spent on the DeepSeek worker in this session
 export type Usage = {
   calls: number
   input: number
@@ -11,11 +11,14 @@ export type Usage = {
   model: string
 }
 
-// 계정 잔액: 세션에서 처음 본 값(start)과 마지막으로 본 값(now)
+// Account balance: the first value seen in the session (start) and the latest (now)
 export type Balance = { currency: string; start: number; now: number } | null
+
+// The language people read, decided once per session for the `language` option it was decided under
+export type UiLang = { option: string; lang: 'en' | 'ko' } | null
 
 declare module 'claude-code' {
   interface PluginState {
-    'deepseek-worker': { totals: Shaped<Usage>; balance: Shaped<Balance> }
+    'deepseek-worker': { totals: Shaped<Usage>; balance: Shaped<Balance>; uiLang: Shaped<UiLang> }
   }
 }

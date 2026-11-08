@@ -1,29 +1,32 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, HttpInit, Register } from 'claude-code'
 
-import type { Balance, Usage } from '../types'
+import type { Balance, UiLang, Usage } from '../types'
 
-// DeepSeek를 Claude의 워커로 쓰는 도구 네 개와 사용량 상태 줄.
-// 별도 서버 없이 Claude Code 안에서 돈다: 파일은 $.fs, 짧은 API 호출은 $.http로 닿는다.
-// $.http.fetch는 30초 안에 끝나야 해서, 시간이 걸리는 생성은 curl을 띄워 스트리밍으로 받는다
-// (curl은 macOS, Linux, Windows 10 이상에 기본으로 들어 있다).
+// Four tools that use DeepSeek as Claude's worker, plus a usage status line.
+// Runs inside Claude Code with no separate server: files go through $.fs, short API calls through $.http.
+// $.http.fetch must finish within 30 seconds, so long generations run through curl and are streamed
+// (curl ships with macOS, Linux and Windows 10+).
+//
+// Text the model reads (tool descriptions, Claude's guide, DeepSeek prompts, tool results and errors) is English.
+// Text people read (status line, /deepseek-usage) comes in English or Korean; see the `language` option.
 
 type Args = Record<string, unknown>
-type EnvName = 'HOME' | 'USERPROFILE' | 'SystemRoot' | 'DEEPSEEK_BASE_URL' | 'DEEPSEEK_MODEL'
+type EnvName = 'HOME' | 'USERPROFILE' | 'SystemRoot' | 'DEEPSEEK_BASE_URL' | 'DEEPSEEK_MODEL' | 'LC_ALL' | 'LC_MESSAGES' | 'LANG'
 
-// 엔진($)은 훅 안에서만 쓸 수 있어서, 도구 구현에는 필요한 기능만 묶어 넘긴다
+// The engine ($) is only usable inside hooks, so the tool code gets just the pieces it needs
 type IO = {
   fetch: (url: string, init: HttpInit) => Promise<{ status: number; ok: boolean; text: string }>
   read: (path: string) => Promise<string>
   write: (path: string, text: string) => Promise<void>
   exists: (path: string) => Promise<boolean>
-  // 링크를 따라간 실제 경로. 없는 경로면 undefined
+  // The real path with links followed; undefined when the path does not exist
   realPath: (path: string) => Promise<string | undefined>
   cwd: () => Promise<string>
-  // Claude가 이 경로를 Read/Write 도구로 다루면 Claude Code가 뭐라고 판단할지 (대화창 없이 묻기만 한다)
+  // What Claude Code would decide if Claude used the Read/Write tool on this path (asks only; no dialog)
   check: (tool: 'Read' | 'Write', filePath: string) => Promise<{ decision: string; reason?: string }>
   env: (name: EnvName) => Promise<string | undefined>
-  // 명령을 띄워 출력을 조각조각 받는다 (input은 표준 입력으로 들어간다)
+  // Starts a command and yields its output in pieces (input goes to stdin)
   spawn: (argv: string[], input: string) => AsyncIterable<{ stream: 'stdout' | 'stderr'; text: string }>
   record: (used: Used[], bal: Bal | undefined) => Promise<void>
 }
@@ -31,59 +34,140 @@ type IO = {
 const PLUGIN = 'deepseek-worker'
 const TOOL = (name: string) => `mcp__${PLUGIN}__${name}`
 
-// 모든 요청에 기본으로 들어가는 지시. 호출 시 system을 주면 이 뒤에 덧붙는다.
-const COMMON_SYSTEM = `너는 상위 에이전트(Claude)가 맡긴 작업 하나를 처리하는 워커다. 결과는 사람이 아니라 에이전트가 읽고 검토한다.
-- 인사말, 서론, 맺음말, 요청하지 않은 요약 없이 요청한 결과만 출력한다.
-- 정보가 부족하면 지어내지 말고, 어떤 가정을 했는지 결과 끝에 짧게 밝힌다.
-- 요청받은 범위만 처리한다. 요청하지 않은 수정, 기능 추가, 내용 확장은 하지 않는다.`
+// ───────── Text the model reads ─────────
+
+// Sent with every request. A `system` argument is appended after it.
+const COMMON_SYSTEM = `You are a worker handling one task delegated by a higher-level agent (Claude). Your output is read and reviewed by that agent, not by a person.
+- Output only what was asked: no greetings, preamble, closing remarks or unrequested summaries.
+- If information is missing, don't make it up; state any assumptions briefly at the end.
+- Stay within the requested scope: no unrequested changes, features or additions.
+- Write prose, code comments and messages in the language of the request, unless the request says otherwise.`
 const FILE_ONLY_INSTRUCTION =
-  '\n\n응답 전체가 그대로 파일에 저장된다. 파일 내용만 출력하고 설명이나 코드 펜스(```)는 붙이지 말 것.' +
-  ' 가정은 따로 적지 말고 가장 합리적인 쪽을 택할 것.'
+  '\n\nYour entire reply is saved to a file as-is. Output only the file content, with no explanation and no code fences (```).' +
+  " Don't list assumptions; pick the most reasonable option."
 const FENCE_RE = /^\s*```[^\n]*\n([\s\S]*?)\n```\s*$/
 
-// Claude에게 주는 사용 지침 (시스템 프롬프트의 한 절)
-const GUIDE = `# DeepSeek 워커 (deepseek_chat · deepseek_batch · deepseek_research)
-사용자가 DeepSeek를 쓰라고 하거나 직접 하라고 명시하면 아래 기준보다 그 요청을 따른다.
-기준상 맞지 않는 작업이라도 따르되, 우려가 있으면 한 줄로만 알린다.
+// Usage guide for Claude (one section of its system prompt)
+const GUIDE = `# DeepSeek worker (deepseek_chat · deepseek_batch · deepseek_research)
+If the user says to use DeepSeek, or to do it yourself, follow that over the criteria below.
+Follow it even when the task doesn't fit the criteria; if you have a concern, mention it in one line.
 
-사용자 지정이 없으면 DeepSeek에 맡길지, 직접 짤지는 "지시+검수 비용"과 "직접 작성 비용" 중 작은 쪽으로 정한다.
+Otherwise, delegate or write it yourself, whichever costs less: "instructing + reviewing" vs "writing it yourself".
 
-DeepSeek에 맡길 때:
-- 결과물이 길고 명세가 분명하다 (테스트 대량 작성, 보일러플레이트, 데이터 변환, 정해진 형식의 코드).
-- 테스트나 실행 결과로 검증할 수 있다.
-- 서로 독립된 작업 여러 개를 deepseek_batch로 병렬 처리할 수 있다.
+Delegate to DeepSeek when:
+- The output is long and well specified (many tests, boilerplate, data conversion, code in a fixed format).
+- It can be verified by tests or by running it.
+- Several independent jobs can run in parallel with deepseek_batch.
 
-직접 짤 때:
-- 몇 줄짜리 작은 수정이다.
-- 여러 파일의 관계, 숨은 규칙, 대화 중 내린 결정 등 맥락이 많이 필요하다.
-- 설계나 원인 분석 같은 판단이 핵심이다.
-- 보안, 데이터 삭제, 돈 계산처럼 틀리면 비싼 코드다.
+Write it yourself when:
+- It is a small change of a few lines.
+- It needs a lot of context: relations across files, unwritten rules, decisions made in this conversation.
+- Judgment is the core of it, such as design or root-cause analysis.
+- Mistakes are expensive: security, data deletion, money calculations.
 
-맡길 때는 참고 파일은 files로 넘기고, 코드 결과는 output_path로 저장해 테스트나 일부 읽기로 검수한다.
-재지시가 두 번을 넘기면 직접 짠다.
+When delegating, pass reference files with files, save code results with output_path, and review by running tests or reading parts.
+After two failed re-instructions, write it yourself.
 
-DeepSeek 캐시는 프롬프트 앞부분이 이전 요청과 똑같을 때만 맞는다.
-- 여러 호출에 공통인 파일은 files 앞쪽에 매번 같은 순서로 넣는다.
-- 같은 공통 파일로 여러 작업을 맡길 때는 하나를 먼저 보내고, 응답이 오면 나머지를 병렬로 보낸다.
+DeepSeek's cache only hits when the start of the prompt matches an earlier request exactly.
+- Put files shared across calls first in files, in the same order every time.
+- When several jobs share the same files, send one first and the rest in parallel after it answers.
 
-최신 정보나 웹 조사가 필요하면 직접 검색하기 전에 deepseek_research를 먼저 쓴다.
-검색 결과와 페이지 본문은 DeepSeek 쪽에서 읽고, 출처가 달린 정리만 돌아온다.`
+When you need current information or web research, use deepseek_research before searching yourself.
+DeepSeek reads the search results and pages; only a summary with sources comes back.`
 
 const DEFAULT_BASE_URL = 'https://api.deepseek.com'
 const DEFAULT_MODEL = 'deepseek-flash'
 const MAX_FILE_CHARS = 200_000
-// output_path 호출의 기본 max_tokens. 사고 토큰도 이 예산을 함께 쓰므로 API 기본(64K)으로는 긴 코드가 잘린다.
+// Default max_tokens for output_path calls. Reasoning tokens share this budget, so the API default (64K) cuts long code.
 const FILE_MAX_TOKENS = 300_000
 const REASONING_EFFORTS = ['none', 'low', 'high', 'max'] as const
-// API 기본값에 맡기지 않고 매번 명시해 보낸다. API 기본이 바뀌어도 동작이 그대로이도록.
+// Always sent explicitly, so behavior stays the same if the API default changes
 const DEFAULT_REASONING_EFFORT = 'high'
-const TRUNCATED_NOTE = '[truncated] 응답이 max_tokens 한도에서 잘렸다. 결과 끝이 미완성이다.'
-const INTERRUPTED_NOTE = '[interrupted] 응답을 받는 중 끊겼다({}). 결과 끝이 미완성이다.'
-const DISABLED_MESSAGE = '[disabled] 사용자가 DeepSeek를 꺼 두었다. DeepSeek 없이 직접 처리할 것.'
-const MODEL_NOTE = 'model은 비워 둘 것(기본 deepseek-flash). 사용자가 다른 모델을 명시적으로 요청한 경우에만 지정한다.'
-const EFFORT_NOTE = 'reasoning_effort는 사고량이다(none=사고 끔, low, high=기본, max). 비워 두면 high.'
+const TRUNCATED_NOTE = '[truncated] The reply hit the max_tokens limit. The end of the result is incomplete.'
+const INTERRUPTED_NOTE = '[interrupted] The reply was cut off while streaming ({}). The end of the result is incomplete.'
+const DISABLED_MESSAGE = '[disabled] The user has turned DeepSeek off. Handle this without DeepSeek.'
+const MODEL_NOTE = 'Leave model empty (default deepseek-flash). Set it only when the user explicitly asks for another model.'
+const EFFORT_NOTE = 'reasoning_effort is how much the model thinks (none = off, low, high = default, max). Empty means high.'
 
-// ───────── 설정: API 키, 주소, 홈 폴더 ─────────
+// ───────── Text people read: English or Korean ─────────
+
+type Lang = 'en' | 'ko'
+
+const UI = {
+  en: {
+    commandDescription: "Show this session's DeepSeek worker token usage and account balance",
+    status: (calls: number, tok: string, hit: number) => `${calls} ${calls === 1 ? 'call' : 'calls'} ${tok}tok hit ${hit}%`,
+    noCalls: 'No DeepSeek calls in this session yet.',
+    detail: (u: Usage, hit: number) => [
+      `DeepSeek usage (this session, ${u.model})`,
+      `  Calls            ${u.calls}`,
+      `  Total tokens     ${u.input + u.output}`,
+      `  Cache hit        ${hit}%`,
+      `  Cached input     ${u.hit}`,
+      `  Uncached input   ${u.miss}`,
+      `  Output           ${u.output} (reasoning ${u.reasoning})`,
+      `  Last call        in ${u.lastIn} · out ${u.lastOut}`,
+    ],
+    balance: (now: string, start: string, spent: string) => `  Balance          ${now} (first seen ${start}, spent since ${spent})`,
+    disabled: (file: string) => `DeepSeek is turned off (delete ${file} to turn it back on).`,
+    keyOk: (bal?: string) => `Key OK${bal ? `, balance ${bal}` : ''}`,
+    noKey: (file: string) =>
+      `No DeepSeek API key. Set the api_key option of ${PLUGIN} in /plugin, or save the key to ${file}, readable only by you.`,
+    keyFailed: (msg: string) => `Key check failed: ${msg}`,
+  },
+  ko: {
+    commandDescription: '이 세션의 DeepSeek 워커 토큰 사용량과 계정 잔액을 자세히 보기',
+    status: (calls: number, tok: string, hit: number) => `${calls}회 ${tok}tok hit ${hit}%`,
+    noCalls: '이 세션에서는 아직 DeepSeek를 호출하지 않았어요.',
+    detail: (u: Usage, hit: number) => [
+      `DeepSeek 사용량 (이 세션, ${u.model})`,
+      `  호출          ${u.calls}회`,
+      `  토큰 합계     ${u.input + u.output}`,
+      `  캐시 적중     ${hit}%`,
+      `  캐시된 입력   ${u.hit}`,
+      `  캐시 안 된 입력 ${u.miss}`,
+      `  출력          ${u.output} (그중 추론 ${u.reasoning})`,
+      `  마지막 호출   입력 ${u.lastIn} · 출력 ${u.lastOut}`,
+    ],
+    balance: (now: string, start: string, spent: string) => `  계정 잔액     ${now} (첫 조회 ${start}, 그 뒤 사용 ${spent})`,
+    disabled: (file: string) => `DeepSeek는 꺼져 있어요(${file}를 지우면 다시 켜져요).`,
+    keyOk: (bal?: string) => `키 정상${bal ? `, 계정 잔액 ${bal}` : ''}`,
+    noKey: (file: string) =>
+      `DeepSeek API 키가 없어요. /plugin 에서 ${PLUGIN}의 api_key 옵션에 넣거나, 본인만 읽을 수 있게 ${file}에 저장하세요.`,
+    keyFailed: (msg: string) => `키 확인 실패: ${msg}`,
+  },
+} satisfies Record<Lang, unknown>
+
+// A locale string such as ko_KR.UTF-8 or ko-KR → its language. C and POSIX say nothing.
+const langOfLocale = (v: string | undefined): Lang | undefined =>
+  !v || /^(C|POSIX)([.@]|$)/.test(v) ? undefined : /^ko([_.@-]|$)/i.test(v) ? 'ko' : 'en'
+
+// The `language` option: en / ko, or auto. auto looks at LC_ALL, LC_MESSAGES and LANG, then at the
+// macOS system language (apps started from the Dock usually have no LANG), and falls back to English.
+async function detectLang(io: IO, option: unknown): Promise<Lang> {
+  if (option === 'en' || option === 'ko') return option
+  for (const name of ['LC_ALL', 'LC_MESSAGES', 'LANG'] as const) {
+    const lang = langOfLocale(await io.env(name))
+    if (lang) return lang
+  }
+  const defaults = '/usr/bin/defaults'
+  if (await io.exists(defaults)) {
+    let out = ''
+    try {
+      for await (const { stream, text } of io.spawn([defaults, 'read', '-g', 'AppleLanguages'], '')) {
+        if (stream === 'stdout') out += text
+      }
+    } catch {
+      return 'en'
+    }
+    // Prints a list such as ( "ko-KR", "en-US" ); the first entry is the preferred language
+    const first = /\(\s*"?([A-Za-z]+[^",\s)]*)/.exec(out)?.[1]
+    return langOfLocale(first) ?? 'en'
+  }
+  return 'en'
+}
+
+// ───────── Settings: API key, endpoint, home folder ─────────
 
 type Config = { key: string; baseUrl: string; model: string; home: string; curl: string; workdir?: string }
 
@@ -93,21 +177,21 @@ async function homeDir(io: IO) {
 
 const configDir = (home: string) => `${home}/.config/deepseek`
 
-// PATH에 심어 둔 가짜 curl이 API 키를 받지 않도록 OS에 들어 있는 curl을 절대 경로로 쓴다
+// Use the OS's own curl by absolute path, so a fake curl planted on PATH never receives the API key
 async function curlPath(io: IO) {
-  const root = await io.env('SystemRoot') // Windows에만 있다
+  const root = await io.env('SystemRoot') // only set on Windows
   const path = root ? `${root.replace(/[\\/]+$/, '')}\\System32\\curl.exe` : '/usr/bin/curl'
-  if (!(await io.exists(path))) throw new Error(`curl을 찾지 못했습니다: ${path}`)
+  if (!(await io.exists(path))) throw new Error(`curl not found: ${path}`)
   return path
 }
 
-// ───────── 경로 권한: files와 output_path는 Claude가 Read/Write로 다룰 수 있는 곳만 ─────────
-// 경로 규칙을 따로 두지 않고 Claude Code의 권한 판단을 그대로 따른다. 그래서 작업 폴더, 세션의 임시 폴더(scratchpad),
-// /add-dir로 더한 폴더는 되고, 사용자가 deny 규칙으로 막은 파일(예: Read(.env))은 DeepSeek로도 나가지 않는다.
+// ───────── Path permissions: files and output_path only where Claude may Read / Write ─────────
+// No path rules of our own: follow Claude Code's permission decision. So the working folder, the session's
+// scratchpad and /add-dir folders work, and files the user blocked with a deny rule (say Read(.env)) never reach DeepSeek.
 
 const isAbsolute = (p: string) => p.startsWith('/') || p.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(p)
 
-// 구분자를 /로 맞추고 . 과 .. 을 푼다
+// Use / as the separator and resolve . and ..
 function normalize(p: string) {
   const parts: string[] = []
   const [head, ...rest] = p.replace(/\\/g, '/').split('/')
@@ -119,7 +203,7 @@ function normalize(p: string) {
   return `${head}/${parts.join('/')}`
 }
 
-// 실제 경로(링크를 따라간 것). 아직 없는 경로면 있는 상위 폴더까지 올라가 실제 경로를 구하고 나머지를 붙인다
+// The real path (links followed). For a path that doesn't exist yet, resolve the nearest existing parent and append the rest
 async function realDir(io: IO, path: string) {
   const tail: string[] = []
   let cur = normalize(path)
@@ -133,24 +217,23 @@ async function realDir(io: IO, path: string) {
   }
 }
 
-// 읽고 쓸 절대 경로를 돌려주고, 안 되는 곳이면 이유와 함께 거절한다.
-// allow → 진행, deny → 거절, ask(사람에게 물어야 하는 곳) → 작업 폴더 안일 때만 진행.
-// 링크면 링크 경로와 링크를 따라간 실제 경로를 둘 다 묻는다: 작업 폴더 안의 링크가 밖의 파일(예: ~/.ssh/id_rsa)이나
-// deny 규칙으로 막은 파일을 가리켜도 새지 않게 한다. 둘 다 allow여야 allow다.
-// 플러그인 옵션 allow_outside_workdir를 켜면 이 확인을 모두 건너뛴다.
+// Returns the absolute path to read or write, or refuses with the reason.
+// allow → go, deny → refuse, ask (a person would be asked) → go only inside the working folder.
+// A link is asked about twice, as itself and as its real target, so a link in the working folder can't reach
+// an outside file (say ~/.ssh/id_rsa) or a deny-ruled one. Both must be allow for allow.
+// The plugin option allow_outside_workdir skips all of this.
 async function checkedPath(io: IO, cfg: Config, p: string, mode: 'read' | 'write') {
   const expanded = expand(cfg, p)
   const abs = isAbsolute(expanded) ? expanded : `${await io.cwd()}/${expanded}`
   if (!cfg.workdir) return abs
-  const verb = mode === 'read' ? '읽을' : '쓸'
   const real = await realDir(io, abs)
   const asked = real === normalize(abs) ? [abs] : [abs, real]
   let allAllowed = true
   for (const x of asked) {
     const verdict = await io.check(mode === 'read' ? 'Read' : 'Write', x)
     if (verdict.decision === 'deny') {
-      const what = x === abs ? '' : `(링크가 가리키는 ${x})`
-      throw new Error(`${p}${what}는 Claude Code 권한 설정이 막은 경로라 ${verb} 수 없습니다${verdict.reason ? `: ${verdict.reason}` : '.'}`)
+      const what = x === abs ? '' : ` (link to ${x})`
+      throw new Error(`Cannot ${mode} ${p}${what}: Claude Code's permission settings block it${verdict.reason ? ` (${verdict.reason})` : ''}.`)
     }
     if (verdict.decision !== 'allow') allAllowed = false
   }
@@ -159,21 +242,24 @@ async function checkedPath(io: IO, cfg: Config, p: string, mode: 'read' | 'write
   const [r, w] = windows ? [real.toLowerCase(), cfg.workdir.toLowerCase()] : [real, cfg.workdir]
   if (r === w || r.startsWith(w.endsWith('/') ? w : `${w}/`)) return abs
   throw new Error(
-    `${p}${real === normalize(abs) ? '' : `(링크가 가리키는 ${real})`}는 작업 폴더(${cfg.workdir}) 밖이고 Claude Code도 확인 없이 허용하지 않는 경로라 ${verb} 수 없습니다. 작업 폴더나 세션 임시 폴더 안 경로를 쓰거나, /add-dir 로 폴더를 추가하거나, /plugin 에서 ${PLUGIN}의 allow_outside_workdir 옵션을 켜세요.`,
+    `Cannot ${mode} ${p}${real === normalize(abs) ? '' : ` (link to ${real})`}: it is outside the working folder (${cfg.workdir}) and Claude Code would not allow it without asking. ` +
+      `Use a path in the working folder or the session scratchpad, add the folder with /add-dir, or turn on the allow_outside_workdir option of ${PLUGIN} in /plugin.`,
   )
 }
 
-// 키는 플러그인 옵션(보안 저장소) → ~/.config/deepseek/api_key 순서로 찾는다.
-// 환경변수는 모든 자식 프로세스에 물려주고 env로 쉽게 드러나므로 키를 받지 않는다
+// The key comes from the plugin option (secure storage), then ~/.config/deepseek/api_key.
+// Never from an environment variable: every child process inherits those, and a plain `env` prints them.
+class NoKeyError extends Error {
+  constructor(readonly keyFile: string) {
+    super(`No DeepSeek API key. Set the api_key option of ${PLUGIN} in /plugin, or save the key to ${keyFile}, readable only by you.`)
+  }
+}
+
 async function findKey(io: IO, optionKey: string, home: string) {
   let key = optionKey.trim()
   const keyFile = `${configDir(home)}/api_key`
   if (!key && (await io.exists(keyFile))) key = (await io.read(keyFile)).trim()
-  if (!key) {
-    throw new Error(
-      `DeepSeek API 키가 없습니다. /plugin 에서 ${PLUGIN} 옵션(api_key)에 넣거나, 본인만 읽을 수 있게 ${keyFile}에 저장하세요.`,
-    )
-  }
+  if (!key) throw new NoKeyError(keyFile)
   return key
 }
 
@@ -191,10 +277,10 @@ async function loadConfig(io: IO, optionKey: string, allowOutside: boolean): Pro
   }
 }
 
-// 이 파일이 있으면 DeepSeek를 끈 것으로 본다. 지우면 다시 켜진다.
+// While this file exists DeepSeek is off. Delete it to turn it back on.
 const disabledFile = (home: string) => `${configDir(home.replace(/[\\/]+$/, ''))}/disabled`
 
-// ───────── API 호출 ─────────
+// ───────── API calls ─────────
 
 async function api(io: IO, cfg: Config, path: string, body?: unknown): Promise<any> {
   const r = await io.fetch(`${cfg.baseUrl}${path}`, {
@@ -206,7 +292,7 @@ async function api(io: IO, cfg: Config, path: string, body?: unknown): Promise<a
   return JSON.parse(r.text)
 }
 
-// curl 설정 파일 문법의 따옴표 문자열 (키와 본문이 명령줄에 드러나지 않게 표준 입력으로 넘긴다)
+// A quoted string in curl's config-file syntax (the key and body go through stdin, never the command line)
 const curlQuote = (s: string) =>
   '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t') + '"'
 
@@ -222,7 +308,7 @@ function curlConfig(cfg: Config, path: string, body: unknown) {
   ].join('\n')
 }
 
-// 30초를 넘길 수 있는 요청(조사 단계의 생성)은 스트리밍 없이 curl로 받는다
+// Requests that may take over 30 seconds (the research steps) go through curl without streaming
 async function curlJson(io: IO, cfg: Config, path: string, body: unknown): Promise<any> {
   let stdout = ''
   let stderr = ''
@@ -234,21 +320,21 @@ async function curlJson(io: IO, cfg: Config, path: string, body: unknown): Promi
   try {
     data = JSON.parse(stdout)
   } catch {
-    throw new Error(`DeepSeek API ${path} 실패: ${(stdout || stderr || '응답 없음').trim().slice(0, 500)}`)
+    throw new Error(`DeepSeek API ${path} failed: ${(stdout || stderr || 'no response').trim().slice(0, 500)}`)
   }
-  if (data.error) throw new Error(`DeepSeek API ${path} 실패: ${JSON.stringify(data.error).slice(0, 500)}`)
+  if (data.error) throw new Error(`DeepSeek API ${path} failed: ${JSON.stringify(data.error).slice(0, 500)}`)
   return data
 }
 
 type Streamed = { content: string; usage: any; model?: string; finish?: string; error?: string }
 
-// /chat/completions를 stream: true로 부르고 SSE 조각을 모은다. 도중에 끊겨도 받은 데까지는 돌려준다.
+// Calls /chat/completions with stream: true and collects the SSE chunks. If cut off midway, returns what arrived.
 async function streamChat(io: IO, cfg: Config, body: Record<string, unknown>): Promise<Streamed> {
   const req = { ...body, stream: true, stream_options: { include_usage: true } }
   const out: Streamed = { content: '', usage: undefined }
   const parts: string[] = []
   let buf = ''
-  let raw = '' // SSE가 아닌 응답(HTTP 오류 본문)을 알아보려고 앞부분만 모아 둔다
+  let raw = '' // the start of a non-SSE reply (an HTTP error body), kept to report it
   let stderr = ''
   let sawEvent = false
   const take = (line: string) => {
@@ -287,10 +373,10 @@ async function streamChat(io: IO, cfg: Config, body: Record<string, unknown>): P
   }
   out.content = parts.join('')
   if (!sawEvent) {
-    // 스트림이 하나도 오지 않았다: curl 오류이거나 API가 오류 JSON을 돌려줬다
-    throw new Error(`DeepSeek API /chat/completions 실패: ${(raw || stderr || out.error || '응답 없음').trim().slice(0, 500)}`)
+    // Not a single event arrived: a curl error, or the API answered with an error JSON
+    throw new Error(`DeepSeek API /chat/completions failed: ${(raw || stderr || out.error || 'no response').trim().slice(0, 500)}`)
   }
-  if (!out.finish && !out.error) out.error = stderr.trim() || '스트림이 끝 표시 없이 닫혔다'
+  if (!out.finish && !out.error) out.error = stderr.trim() || 'stream closed without a finish marker'
   return out
 }
 
@@ -307,7 +393,7 @@ function tokensOf(u: any): Tokens | undefined {
   }
 }
 
-// 결과 끝에 붙는 사용량 줄: [usage: 모델, in=.. out=.. hit=.. miss=.. reasoning=..]
+// The usage line at the end of a result: [usage: model, in=.. out=.. hit=.. miss=.. reasoning=..]
 function usageLine(model: string, t: Tokens) {
   const extra = (['hit', 'miss', 'reasoning'] as const)
     .filter(k => t[k] !== undefined)
@@ -319,7 +405,7 @@ function usageLine(model: string, t: Tokens) {
 function checkEffort(effort: unknown) {
   const e = (effort as string | undefined) || DEFAULT_REASONING_EFFORT
   if (!(REASONING_EFFORTS as readonly string[]).includes(e)) {
-    throw new Error(`reasoning_effort는 ${REASONING_EFFORTS.join(', ')} 중 하나여야 합니다: ${JSON.stringify(effort)}`)
+    throw new Error(`reasoning_effort must be one of ${REASONING_EFFORTS.join(', ')}: ${JSON.stringify(effort)}`)
   }
   return e
 }
@@ -376,11 +462,11 @@ async function balanceOf(io: IO, cfg: Config): Promise<{ currency: string; total
     const b = (await api(io, cfg, '/user/balance')).balance_infos?.[0]
     return b ? { currency: b.currency, total: Number(b.total_balance) } : undefined
   } catch {
-    return undefined // 잔액 조회가 실패해도 본 작업 결과는 그대로 돌려준다
+    return undefined // a failed balance lookup never spoils the actual result
   }
 }
 
-// ───────── 파일 저장 ─────────
+// ───────── Saving files ─────────
 
 async function saveOutput(io: IO, cfg: Config, content: string, outputPath: string) {
   const m = FENCE_RE.exec(content)
@@ -391,42 +477,33 @@ async function saveOutput(io: IO, cfg: Config, content: string, outputPath: stri
   return `saved: ${path} (${content.split('\n').length - 1} lines, ${new TextEncoder().encode(content).length} bytes)`
 }
 
-// ───────── 상태 줄과 /deepseek-usage ─────────
+// ───────── Status line and /deepseek-usage ─────────
 
 const EMPTY: Usage = { calls: 0, input: 0, output: 0, hit: 0, miss: 0, reasoning: 0, lastIn: 0, lastOut: 0, model: '' }
-// 필드를 바꾸면 태그를 올린다: 예전 버전이 저장한 값은 버리고 초기값으로 시작한다
+// Bump the shape tag when the fields change: values saved by an older version are dropped for the initial value
 const totals = atom({ plugin: 'deepseek-worker', key: 'totals' } as const, EMPTY, { shape: 'totals-1' })
 const balance = atom({ plugin: 'deepseek-worker', key: 'balance' } as const, null as Balance, { shape: 'balance-1' })
+const uiLang = atom({ plugin: 'deepseek-worker', key: 'uiLang' } as const, null as UiLang, { shape: 'uiLang-1' })
 
 const fmt = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : `${n}`)
 const cachePct = (u: Usage) => (u.hit + u.miss > 0 ? Math.round((u.hit / (u.hit + u.miss)) * 100) : 0)
 const money = (currency: string, v: number) =>
   `${currency === 'USD' ? '$' : currency === 'CNY' ? '¥' : `${currency} `}${v.toFixed(2)}`
 
-function statusText(u: Usage, b: Balance) {
+function statusText(lang: Lang, u: Usage, b: Balance) {
   if (u.calls === 0) return undefined
-  // 앱이 앞에 mod 이름을 붙여 주므로 숫자만 짧게
-  const head = `${u.calls}회 ${fmt(u.input + u.output)}tok hit ${cachePct(u)}%`
+  // The app puts the plugin name in front, so keep it to the numbers
+  const head = UI[lang].status(u.calls, fmt(u.input + u.output), cachePct(u))
   return b ? `${head} ${money(b.currency, b.now)}` : head
 }
 
-function detailText(u: Usage, b: Balance) {
-  if (u.calls === 0) return '이 세션에서는 아직 DeepSeek를 호출하지 않았어요.'
-  const lines = [
-    `DeepSeek 사용량 (이 세션, ${u.model})`,
-    `  호출          ${u.calls}회`,
-    `  토큰 합계     ${u.input + u.output}`,
-    `  캐시 적중     ${cachePct(u)}%`,
-    `  캐시된 입력   ${u.hit}`,
-    `  캐시 안 된 입력 ${u.miss}`,
-    `  출력          ${u.output} (그중 추론 ${u.reasoning})`,
-    `  마지막 호출   입력 ${u.lastIn} · 출력 ${u.lastOut}`,
-  ]
+function detailText(lang: Lang, u: Usage, b: Balance) {
+  const t = UI[lang]
+  if (u.calls === 0) return t.noCalls
+  const lines = t.detail(u, cachePct(u))
   if (b) {
-    // 잔액은 호출이 끝난 뒤에 조회하므로, 세션에서 처음 본 잔액엔 첫 호출 비용이 이미 빠져 있다
-    lines.push(
-      `  계정 잔액     ${money(b.currency, b.now)} (첫 조회 ${money(b.currency, b.start)}, 그 뒤 사용 ${money(b.currency, Math.max(0, b.start - b.now))})`,
-    )
+    // The balance is looked up after each call, so the first one seen already has the first call's cost taken off
+    lines.push(t.balance(money(b.currency, b.now), money(b.currency, b.start), money(b.currency, Math.max(0, b.start - b.now))))
   }
   return lines.join('\n')
 }
@@ -446,7 +523,7 @@ function addUsage(t: Usage, used: Used[]): Usage {
       input: n.input + x.in,
       output: n.output + x.out,
       hit: n.hit + (x.hit ?? 0),
-      // 캐시 정보가 없으면 입력 전체를 캐시 안 된 것으로 센다
+      // Without cache info, count the whole input as uncached
       miss: n.miss + (x.miss ?? (x.hit === undefined ? x.in : 0)),
       reasoning: n.reasoning + (x.reasoning ?? 0),
     }
@@ -454,34 +531,35 @@ function addUsage(t: Usage, used: Used[]): Usage {
   return n
 }
 
-// 통화가 바뀌면(드묾) 그 값부터 다시 잰다
+// If the currency changes (rare), start measuring again from that value
 const nextBalance = (prev: Balance, bal: Bal): Balance =>
   prev && prev.currency === bal.currency
     ? { ...prev, now: bal.total }
     : { currency: bal.currency, start: bal.total, now: bal.total }
 
-// /deepseek-usage를 호출 전에 쓰면 그 자리에서 잔액을 조회해 키가 맞는지 알려 준다 (잔액 조회는 무료)
-async function keyCheckText(io: IO, optionKey: string) {
-  const head = '이 세션에서는 아직 DeepSeek를 호출하지 않았어요.'
+// /deepseek-usage before any call looks up the balance on the spot to tell whether the key works (free)
+async function keyCheckText(io: IO, lang: Lang, optionKey: string) {
+  const t = UI[lang]
   const home = await homeDir(io)
-  if (await io.exists(disabledFile(home))) return `${head}\nDeepSeek는 꺼져 있어요(${disabledFile(home)}를 지우면 다시 켜져요).`
+  if (await io.exists(disabledFile(home))) return `${t.noCalls}\n${t.disabled(disabledFile(home))}`
   try {
     const cfg = { key: await findKey(io, optionKey, home), baseUrl: await baseUrlOf(io) } as Config
     const b = (await api(io, cfg, '/user/balance')).balance_infos?.[0]
-    return `${head}\n키 정상${b ? `, 계정 잔액 ${money(b.currency, Number(b.total_balance))}` : ''}`
+    return `${t.noCalls}\n${t.keyOk(b ? money(b.currency, Number(b.total_balance)) : undefined)}`
   } catch (err) {
-    return `${head}\n키 확인 실패: ${(err as Error).message}`
+    if (err instanceof NoKeyError) return `${t.noCalls}\n${t.noKey(err.keyFile)}`
+    return `${t.noCalls}\n${t.keyFailed((err as Error).message)}`
   }
 }
 
-// 호출 하나가 끝나면 사용량을 더하고, 잔액을 조회해 결과 텍스트 끝에 붙인다
+// When a call finishes: add up usage, look up the balance and append it to the result text
 async function finish(io: IO, cfg: Config, text: string, used: Used[]) {
   const bal = await balanceOf(io, cfg)
   if (used.length > 0) await io.record(used, bal)
   return bal ? `${text}\n[balance: ${bal.currency} ${bal.total.toFixed(2)}]` : text
 }
 
-// ───────── 도구 ─────────
+// ───────── Tools ─────────
 
 async function chat(io: IO, cfg: Config, a: Args) {
   const prompt = String(a.prompt ?? '')
@@ -491,31 +569,31 @@ async function chat(io: IO, cfg: Config, a: Args) {
     const t = tail(r)
     return finish(io, cfg, t ? `${r.content}\n\n${t}` : r.content, r.usage ? [{ model: r.model, t: r.usage }] : [])
   }
-  await checkedPath(io, cfg, outputPath, 'write') // 생성 비용을 쓰기 전에 저장할 수 있는 경로인지 먼저 본다
+  await checkedPath(io, cfg, outputPath, 'write') // check the path can be written before paying for the generation
   const r = await request(io, cfg, a, { prompt: prompt + FILE_ONLY_INSTRUCTION, maxTokens: FILE_MAX_TOKENS })
-  // 빈 응답이나 미완성 응답이 기존 파일을 덮어쓰지 않도록 한다
+  // An empty or incomplete reply must not overwrite an existing file
   let saved: string
   if (!r.content.trim()) {
-    saved = `[not saved] 응답 본문이 비어 있어 ${outputPath}에 쓰지 않았다(기존 파일 그대로).`
+    saved = `[not saved] The reply was empty, so nothing was written to ${outputPath} (existing file unchanged).`
   } else if (r.complete) {
     saved = await saveOutput(io, cfg, r.content, outputPath)
   } else {
     saved =
       (await saveOutput(io, cfg, r.content, `${outputPath}.partial`)) +
-      ` — 미완성이라 .partial로 저장했다(${outputPath}는 그대로).`
+      ` — incomplete, so saved as .partial (${outputPath} unchanged).`
   }
   const t = tail(r)
   return finish(io, cfg, t ? `${saved}\n${t}` : saved, r.usage ? [{ model: r.model, t: r.usage }] : [])
 }
 
-// 동시 실행 수: 숫자가 아니면 기본 8, 1~16으로 자른다 (curl 프로세스가 한꺼번에 너무 많이 뜨지 않게)
+// Concurrency: 8 if not a number, clamped to 1-16 (so not too many curl processes start at once)
 const MAX_CONCURRENCY = 16
 const concurrencyOf = (v: unknown) => {
   const n = Math.floor(Number(v ?? 8))
   return Number.isFinite(n) ? Math.max(1, Math.min(MAX_CONCURRENCY, n)) : 8
 }
 
-// n개씩 동시에 실행하고 결과는 입력 순서대로
+// Runs n at a time; results come back in input order
 async function pool<T>(n: number, jobs: (() => Promise<T>)[]): Promise<T[]> {
   const out = new Array<T>(jobs.length)
   let next = 0
@@ -541,7 +619,7 @@ async function batch(io: IO, cfg: Config, a: Args) {
         const t = tail(r)
         return `=== #${i} ===\n${t ? `${r.content}\n\n${t}` : r.content}`
       } catch (err) {
-        return `=== #${i} ===\n[error] ${(err as Error).message}` // 한 건 실패가 전체를 막지 않도록
+        return `=== #${i} ===\n[error] ${(err as Error).message}` // one failure doesn't stop the rest
       }
     }),
   )
@@ -552,29 +630,29 @@ async function models(io: IO, cfg: Config) {
   return ((await api(io, cfg, '/models')).data ?? []).map((m: { id: string }) => m.id).join('\n')
 }
 
-// ───────── 웹 조사: DeepSeek Search·Fetch API를 도구로 주고 모델이 스스로 검색을 반복한다 ─────────
-// DeepSeek 웹챗의 검색과 같은 백엔드다 (https://api-docs.deepseek.com/guides/search).
-// 성공한 요청 1,000건당 0.75달러씩, 검색과 페이지 읽기가 따로 과금된다.
+// ───────── Web research: give the model DeepSeek's Search and Fetch APIs as tools and let it search repeatedly ─────────
+// The same backend as DeepSeek's web chat search (https://api-docs.deepseek.com/guides/search).
+// Billed separately for searches and page fetches, $0.75 per 1,000 successful requests each.
 
-const RESEARCH_SYSTEM = `웹을 검색해 질문에 답한다.
-- web_search로 검색하고, 결과 요약만으로 부족하면 web_fetch로 페이지 본문을 읽는다.
-- 한 번에 끝내지 말고, 결과를 보고 검색어를 바꾸거나 좁혀 필요한 만큼 다시 검색한다. 서로 다른 출처로 교차 확인한다.
-- 서로 독립적인 검색(다른 언어, 다른 측면, 여러 후보)이나 여러 페이지 읽기는 한 번에 같이 요청한다. 동시에 실행되어 빠르다.
-- 최신 정보가 중요한 질문이면 날짜를 확인하고, 오래된 정보는 오래됐다고 밝힌다.
-- 답은 질문과 같은 언어로, 핵심부터 간결하게 쓴다. 근거가 된 문장마다 [1]처럼 출처 번호를 붙이고, 끝에 "출처" 목록(번호. 제목 — URL)을 단다.
-- 검색으로 확인하지 못한 내용은 확인하지 못했다고 쓴다.`
+const RESEARCH_SYSTEM = `Answer the question by searching the web.
+- Search with web_search; when the result summaries aren't enough, read the page with web_fetch.
+- Don't stop at one search: look at the results, then rephrase or narrow the query and search again as needed. Cross-check with independent sources.
+- Request independent searches (other languages, other aspects, several candidates) or several page reads together in one turn; they run in parallel.
+- When recency matters, check dates and say when information is outdated.
+- Answer in the language of the question, most important point first, concisely. Cite sources as [1] after each supported sentence, and end with a sources list (number. title — URL) under a heading in the answer's language.
+- Say so when something couldn't be confirmed by searching.`
 
 const RESEARCH_TOOLS = [
   {
     type: 'function',
     function: {
       name: 'web_search',
-      description: '웹 검색. site:, -site:, "정확한 구", lang:, after:YYYY-MM-DD, before: 연산자를 쓸 수 있다.',
+      description: 'Web search. Supports the operators site:, -site:, "exact phrase", lang:, after:YYYY-MM-DD and before:.',
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: '검색어 (128자 이내)' },
-          count: { type: 'integer', description: '결과 수 1~20, 기본 8' },
+          query: { type: 'string', description: 'Search query (128 characters max)' },
+          count: { type: 'integer', description: 'Number of results, 1-20, default 8' },
         },
         required: ['query'],
       },
@@ -584,14 +662,14 @@ const RESEARCH_TOOLS = [
     type: 'function',
     function: {
       name: 'web_fetch',
-      description: 'URL의 페이지 본문을 마크다운으로 읽는다.',
+      description: 'Reads the page at a URL as Markdown.',
       parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] },
     },
   },
 ]
 
-const SNIPPET_CHARS = 600 // 검색 결과 하나당 모델에게 넘기는 요약 길이
-const FETCH_CHARS = 12_000 // 페이지 본문을 넘기는 최대 길이
+const SNIPPET_CHARS = 600 // summary length per search result handed to the model
+const FETCH_CHARS = 12_000 // most page text handed to the model
 
 async function webSearch(io: IO, cfg: Config, query: string, count: number, question: string) {
   const data = await api(io, cfg, '/v1/tools/search', {
@@ -603,18 +681,18 @@ async function webSearch(io: IO, cfg: Config, query: string, count: number, ques
     const summary = String(x.summary || x.snippet || '').trim().replace(/\n/g, ' ')
     return (
       `(${i + 1}) ${x.title ?? ''}\n    ${x.url ?? ''}` +
-      ` · ${x.site_name || ''} · ${x.date || '날짜 없음'} · 신뢰도 ${x.authority ?? -1}\n` +
+      ` · ${x.site_name || ''} · ${x.date || 'no date'} · authority ${x.authority ?? -1}\n` +
       `    ${summary.slice(0, SNIPPET_CHARS)}`
     )
   })
-  return rows.join('\n') || '결과 없음'
+  return rows.join('\n') || 'no results'
 }
 
 async function webFetch(io: IO, cfg: Config, url: string) {
   const data = await api(io, cfg, '/v1/tools/fetch', { url })
   let content = String(data.content || '')
-  if (content.length > FETCH_CHARS) content = content.slice(0, FETCH_CHARS) + '\n...[이하 생략]'
-  return content ? `# ${data.title ?? ''}\n\n${content}` : '본문을 가져오지 못했다.'
+  if (content.length > FETCH_CHARS) content = content.slice(0, FETCH_CHARS) + '\n...[rest omitted]'
+  return content ? `# ${data.title ?? ''}\n\n${content}` : 'Could not fetch the page text.'
 }
 
 async function research(io: IO, cfg: Config, a: Args) {
@@ -628,7 +706,7 @@ async function research(io: IO, cfg: Config, a: Args) {
     { role: 'user', content: question },
   ]
   const total: Tokens = { in: 0, out: 0 }
-  const trail: string[] = [] // 검색 과정: 무엇을 검색하고 읽었는지 남긴다
+  const trail: string[] = [] // what was searched and read, in order
   let searches = 0
   let fetches = 0
   let rounds = 0
@@ -659,11 +737,11 @@ async function research(io: IO, cfg: Config, a: Args) {
       break
     }
     const turn: Record<string, unknown> = { role: 'assistant', content: msg.content ?? '', tool_calls: calls }
-    // 생각하는 모델은 도구 호출이 이어지는 동안 자기 추론을 다시 받아야 한다
+    // A thinking model must get its own reasoning back while tool calls continue
     if (msg.reasoning_content) turn.reasoning_content = msg.reasoning_content
     messages.push(turn)
-    // 한 턴에 나온 도구 호출들은 동시에 실행한다. 한도 판단과 검색 과정 기록은 순서대로 먼저 하고,
-    // 결과는 호출 순서대로 돌려준다 (Search·Fetch API는 엔드포인트당 초당 5회 제한이라 4개씩)
+    // Tool calls from one turn run in parallel. Limits and the trail are decided first, in order,
+    // and results go back in call order (the Search and Fetch APIs allow 5 requests per second per endpoint, so 4 at a time)
     rounds++
     const jobs = calls.map((c): (() => Promise<string>) => {
       let args: any = {}
@@ -672,20 +750,20 @@ async function research(io: IO, cfg: Config, a: Args) {
       } catch {}
       const name = c.function?.name
       if (name === 'web_search') {
-        if (searches >= maxSearches) return async () => '검색 한도에 도달했다. 지금까지 찾은 내용으로 답하라.'
+        if (searches >= maxSearches) return async () => 'Search limit reached. Answer with what you have found so far.'
         searches++
         const q = String(args.query ?? '')
-        trail.push(`[${rounds}] 검색: ${q}`)
+        trail.push(`[${rounds}] search: ${q}`)
         return () => webSearch(io, cfg, q, Number(args.count) || 8, question)
       }
       if (name === 'web_fetch') {
-        if (fetches >= maxFetches) return async () => '페이지 읽기 한도에 도달했다. 지금까지 찾은 내용으로 답하라.'
+        if (fetches >= maxFetches) return async () => 'Page read limit reached. Answer with what you have found so far.'
         fetches++
         const u = String(args.url ?? '')
-        trail.push(`[${rounds}] 읽기: ${u}`)
+        trail.push(`[${rounds}] fetch: ${u}`)
         return () => webFetch(io, cfg, u)
       }
-      return async () => `알 수 없는 도구: ${name}`
+      return async () => `Unknown tool: ${name}`
     })
     const outs = await pool(
       4,
@@ -693,21 +771,21 @@ async function research(io: IO, cfg: Config, a: Args) {
         try {
           return await job()
         } catch (err) {
-          return `[도구 오류] ${(err as Error).message}` // 검색 하나가 실패해도 조사는 이어간다
+          return `[tool error] ${(err as Error).message}` // one failed search doesn't stop the research
         }
       }),
     )
     calls.forEach((c, k) => messages.push({ role: 'tool', tool_call_id: c.id, content: outs[k] }))
   }
   if (answer === undefined) {
-    // 단계 한도를 다 쓰면 도구 없이 지금까지로 답하게 한다
-    messages.push({ role: 'user', content: '검색을 멈추고 지금까지 찾은 내용으로 답하라.' })
+    // Out of steps: answer without tools from what was found
+    messages.push({ role: 'user', content: 'Stop searching and answer with what you have found so far.' })
     answer = (await step(false)).content ?? ''
   }
 
   const trace = `[research: searches=${searches} fetches=${fetches} rounds=${rounds}]\n` + trail.map(t => `- ${t}`).join('\n')
   const usage = usageLine(respModel, total)
-  // 단계가 여러 번이어도 사용량에서는 호출 1회로 센다
+  // However many steps it took, usage counts it as one call
   const used = [{ model: respModel, t: total }]
   const outputPath = a.output_path as string | undefined
   if (outputPath) {
@@ -717,10 +795,10 @@ async function research(io: IO, cfg: Config, a: Args) {
   return finish(io, cfg, `${answer}\n\n${trace}\n${usage}`, used)
 }
 
-// ───────── 도구 등록 ─────────
+// ───────── Tool registration ─────────
 
 const COMMON_PROPS = {
-  system: { type: 'string', description: '기본 워커 지시 뒤에 덧붙일 system 지시' },
+  system: { type: 'string', description: 'Extra system instructions appended after the default worker instructions' },
   model: { type: 'string', description: MODEL_NOTE },
   temperature: { type: 'number' },
   max_tokens: { type: 'integer' },
@@ -737,15 +815,15 @@ type ToolDef = {
 const TOOLS: ToolDef[] = [
   {
     name: 'deepseek_chat',
-    description: `DeepSeek에 작업 하나를 맡기고 결과 텍스트를 받는다.
+    description: `Hands one task to DeepSeek and returns the result text.
 
-files에 로컬 파일 경로를 주면 직접 읽어 프롬프트 앞에 붙인다(호출하는 쪽이 파일 내용을 인자로 옮길 필요가 없다).
-output_path를 주면 응답을 그 파일에 바로 저장하고(덮어씀) 경로·줄 수만 돌려준다.
-코드 생성처럼 결과가 긴 작업에 쓰면 결과 전문이 호출하는 쪽 컨텍스트로 오지 않는다.
-필요하면 저장된 파일을 테스트하거나 일부만 읽어 확인할 것.
-output_path가 있으면 max_tokens 기본값은 300000이다(사고 토큰도 이 예산을 쓴다).
-응답이 잘리면 [truncated] 줄이 붙고 output_path 대신 <output_path>.partial에 저장한다(기존 파일은 그대로).
-본문이 비면 아무 파일도 쓰지 않는다.
+files: local file paths; the tool reads them itself and puts them before the prompt (no need to copy file contents into arguments).
+output_path: saves the reply straight to that file (overwriting) and returns only the path and line count.
+Use it for long outputs such as code generation, so the full result never enters the caller's context.
+Then test the saved file or read parts of it as needed.
+With output_path, max_tokens defaults to 300000 (reasoning tokens share this budget).
+If the reply is truncated, a [truncated] line is added and it is saved to <output_path>.partial instead (the existing file is unchanged).
+If the reply is empty, no file is written.
 ${EFFORT_NOTE}
 ${MODEL_NOTE}`,
     inputSchema: {
@@ -762,7 +840,7 @@ ${MODEL_NOTE}`,
   },
   {
     name: 'deepseek_batch',
-    description: `여러 프롬프트를 DeepSeek에 병렬로 보내고 결과를 순서대로 돌려준다.
+    description: `Sends several prompts to DeepSeek in parallel and returns the results in order.
 
 ${EFFORT_NOTE}
 ${MODEL_NOTE}`,
@@ -779,15 +857,15 @@ ${MODEL_NOTE}`,
   },
   {
     name: 'deepseek_research',
-    description: `DeepSeek가 웹을 스스로 여러 번 검색·열람해 질문에 답하고, 출처가 달린 정리만 돌려준다.
+    description: `DeepSeek searches and reads the web on its own, several times, and returns only a summary with sources.
 
-DeepSeek 웹챗과 같은 Search·Fetch API를 쓴다. 최신 정보, 문서 확인, 비교 조사처럼
-웹 검색이 필요한 질문에 쓴다. 검색 결과와 페이지 본문은 호출하는 쪽 컨텍스트로 오지 않는다.
-결과 끝에 검색 과정(검색어, 읽은 URL)과 사용량이 붙는다.
-max_searches: 검색 횟수 한도(1~20, 기본 8). 페이지 읽기는 그 절반까지.
-output_path를 주면 답을 그 파일에 저장하고 경로만 돌려준다.
+Uses the same Search and Fetch API as DeepSeek's web chat. Use it for questions that need the web:
+current information, checking docs, comparisons. Search results and page text never enter the caller's context.
+The result ends with the search trail (queries, URLs read) and usage.
+max_searches: search limit (1-20, default 8). Page reads up to half of that.
+output_path: saves the answer to that file and returns only the path.
 ${MODEL_NOTE}
-비용: 검색·읽기 각각 성공 1,000건당 0.75달러 + 토큰 비용.`,
+Cost: $0.75 per 1,000 successful searches and per 1,000 page reads, plus tokens.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -802,14 +880,14 @@ ${MODEL_NOTE}
   },
   {
     name: 'deepseek_models',
-    description: '사용 가능한 DeepSeek 모델 목록.',
+    description: 'Lists the available DeepSeek models.',
     inputSchema: { type: 'object', properties: {} },
     run: (io, cfg) => models(io, cfg),
   },
 ]
 
-// 엔진($)에서 도구 구현이 쓰는 기능만 묶는다
-function makeIO($: EngineInterface): IO {
+// Bundles the parts of the engine ($) the tool code uses
+function makeIO($: EngineInterface, langOption: unknown): IO {
   return {
     fetch: (url, init) => $.http.fetch(url, init),
     read: path => $.fs.read(path),
@@ -836,40 +914,56 @@ function makeIO($: EngineInterface): IO {
           return $.env.get('DEEPSEEK_BASE_URL')
         case 'DEEPSEEK_MODEL':
           return $.env.get('DEEPSEEK_MODEL')
+        case 'LC_ALL':
+          return $.env.get('LC_ALL')
+        case 'LC_MESSAGES':
+          return $.env.get('LC_MESSAGES')
+        case 'LANG':
+          return $.env.get('LANG')
       }
     },
     record: async (used, bal) => {
       const u = await update($, totals, prev => addUsage(prev, used))
       const b = bal ? await update($, balance, prev => nextBalance(prev, bal)) : await read($, balance)
-      $.ui.status(statusText(u, b))
+      $.ui.status(statusText(await langOf($, langOption), u, b))
     },
   }
+}
+
+// The language people read. Detected once per session (detection may start a process) and kept in $.state;
+// detected again when the `language` option changes
+async function langOf($: EngineInterface, option: unknown): Promise<Lang> {
+  const key = String(option ?? 'auto')
+  const saved = await read($, uiLang)
+  if (saved && saved.option === key) return saved.lang
+  const lang = await detectLang(makeIO($, option), option)
+  await update($, uiLang, () => ({ option: key, lang }))
+  return lang
 }
 
 export const register: Register = (on, options) => {
   const optionKey = String(options.api_key ?? '')
   const allowOutside = options.allow_outside_workdir === true
+  const langOption = options.language
 
   on('session.start', async ($, e, next) => {
+    const lang = await langOf($, langOption)
     try {
-      await $.command.register({
-        name: 'deepseek-usage',
-        description: '이 세션의 DeepSeek 워커 토큰 사용량과 계정 잔액을 자세히 보기',
-      })
+      await $.command.register({ name: 'deepseek-usage', description: UI[lang].commandDescription })
     } catch {
-      // 같은 이름을 다른 플러그인(예전 deepseek-usage mod)이 이미 등록했으면 명령만 건너뛴다
+      // Another plugin (such as the old deepseek-usage mod) already registered the name; skip just the command
     }
-    // ~/.config/deepseek/disabled 가 있으면 도구를 아예 등록하지 않는다
+    // With ~/.config/deepseek/disabled present, don't register the tools at all
     const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE')) || ''
     if (!(await $.fs.exists(disabledFile(home)))) {
       for (const t of TOOLS) await $.tool.register({ name: t.name, description: t.description, inputSchema: t.inputSchema })
     }
-    // 다시 불러와도 합계는 $.state에 남아 있으므로 상태 줄을 되살린다
-    $.ui.status(statusText(await read($, totals), await read($, balance)))
+    // Totals survive a reload in $.state, so restore the status line
+    $.ui.status(statusText(lang, await read($, totals), await read($, balance)))
     return next(e)
   })
 
-  // Claude에게 언제 맡기고 언제 직접 할지 알려 주는 지침
+  // Tells Claude when to delegate and when to do it itself
   on('prompt.compose', async ($, e, next) => {
     const r = await next(e)
     const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE')) || ''
@@ -878,21 +972,22 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'deepseek-usage' }, async $ => {
+    const lang = await langOf($, langOption)
     const u = await read($, totals)
-    if (u.calls === 0) return { text: await keyCheckText(makeIO($), optionKey) }
-    return { text: detailText(u, await read($, balance)) }
+    if (u.calls === 0) return { text: await keyCheckText(makeIO($, langOption), lang, optionKey) }
+    return { text: detailText(lang, u, await read($, balance)) }
   })
 
   on('tool.call', { tool: /^mcp__deepseek-worker__deepseek_(chat|batch|research|models)$/ }, async ($, e) => {
     const t = TOOLS.find(x => TOOL(x.name) === e.tool)
-    if (!t) return { deny: `알 수 없는 도구: ${e.tool}` }
-    const io = makeIO($)
+    if (!t) return { deny: `Unknown tool: ${e.tool}` }
+    const io = makeIO($, langOption)
     try {
       if (await io.exists(disabledFile(await homeDir(io)))) return { result: DISABLED_MESSAGE }
       const cfg = await loadConfig(io, optionKey, allowOutside)
       return { result: await t.run(io, cfg, { ...(e as object) } as Args) }
     } catch (err) {
-      return { deny: `${t.name} 실패: ${(err as Error).message}` }
+      return { deny: `${t.name} failed: ${(err as Error).message}` }
     }
   })
 }
