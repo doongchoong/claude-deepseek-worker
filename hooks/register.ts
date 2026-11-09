@@ -1031,6 +1031,62 @@ function rememberPattern(command: string) {
   return /^[A-Za-z][\w.-]*$/.test(w[0]!) ? `${w[0]} *` : c
 }
 
+// ───────── Command chains: judged part by part ─────────
+
+type Part = { text: string; afterPipe: boolean }
+
+// Splits a command on &&, ||, ; and | outside quotes. Undefined when it uses syntax that is never judged
+// in parts: redirection to a file, substitution ($( ), backticks), background &, subshells, globs, escapes.
+// Discarding output (>/dev/null, 2>/dev/null) and joining streams (2>&1) are allowed.
+function splitCommand(command: string): Part[] | undefined {
+  const s = command.replace(/(^|\s)[12]?>\s*\/dev\/null(?=[\s|;&]|$)/g, ' ').replace(/(^|\s)[12]>&[12](?=[\s|;&]|$)/g, ' ')
+  const parts: Part[] = []
+  let cur = ''
+  let quote: string | undefined
+  let afterPipe = false
+  const push = () => {
+    parts.push({ text: cur.trim(), afterPipe })
+    cur = ''
+  }
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]!
+    if (quote) {
+      if (ch === quote) quote = undefined
+      else if (quote === '"' && (ch === '$' || ch === '`' || ch === '\\')) return undefined
+      cur += ch
+    } else if (ch === "'" || ch === '"') {
+      quote = ch
+      cur += ch
+    } else if ((ch === '&' && s[i + 1] === '&') || (ch === '|' && s[i + 1] === '|')) {
+      push()
+      afterPipe = false
+      i++
+    } else if (ch === ';') {
+      push()
+      afterPipe = false
+    } else if (ch === '|') {
+      push()
+      afterPipe = true
+    } else if ('&$`<>(){}\\*?!\n\r'.includes(ch)) {
+      return undefined
+    } else {
+      cur += ch
+    }
+  }
+  if (quote) return undefined
+  push()
+  return parts.every(p => p.text) ? parts : undefined
+}
+
+// Parts that are fine anywhere: printing and other harmless commands
+const SAFE_PARTS = [/^echo(\s.*)?$/, /^date(\s+[-+%\w:]+)*$/, /^true$/, /^(python3?|node|npm|pnpm|yarn|cargo|go|rustc|java|ruby|git) (--version|-V|version)$/, /^which [\w.-]+$/]
+// Filters that only reshape what comes down the pipe; allowed after a | with no file arguments
+const PIPE_FILTERS = new Set(['head', 'tail', 'grep', 'egrep', 'wc', 'sort', 'uniq', 'cut', 'tr', 'cat'])
+const isPipeFilter = (p: Part) => {
+  const w = p.text.match(/'[^']*'|"[^"]*"|\S+/g) ?? []
+  return p.afterPipe && PIPE_FILTERS.has(w[0]!) && w.length <= 5 && w.slice(1).every(a => !/[\/~]/.test(a) && (a.startsWith('-') || /^['"]/.test(a) || /^[\w.,:=+-]+$/.test(a)))
+}
+
 const matchesRemembered = (pattern: string, command: string) => {
   const c = command.trim()
   if (!pattern.endsWith(' *')) return pattern === c
@@ -1163,24 +1219,66 @@ async function agent(io: IO, cfg: Config, a: Args) {
     const verdict = await io.checkCommand(command)
     if (verdict.decision === 'deny') return refuse(`blocked by the user's permission rules${verdict.reason ? `: ${verdict.reason}` : ''}`)
     let how = 'allowed by rule'
-    if (verdict.decision !== 'allow' && isReadOnlyDefault(command)) {
-      how = 'read-only default'
-    } else if (verdict.decision !== 'allow' && !approvedThisRun.has(command)) {
+    if (verdict.decision !== 'allow' && approvedThisRun.has(command)) {
+      how = 'approved by the user'
+    } else if (verdict.decision !== 'allow') {
       const projects = await loadAllowed(io, cfg.home)
       const project = await realDir(io, cwd)
-      const hit = (projects[project] ?? []).find(p => matchesRemembered(p, command))
-      if (hit !== undefined) {
-        how = `remembered approval: ${hit}`
+      const remembered = projects[project] ?? []
+      const parts = splitCommand(command)
+      // Judge each part: a rule, a safe part, a remembered approval, or new (to ask about)
+      const hows: string[] = []
+      const fresh: Part[] = []
+      let neverRemember = false
+      if (parts) {
+        let dir = cwd
+        for (const part of parts) {
+          const v = await io.checkCommand(part.text)
+          if (v.decision === 'deny') return refuse(`\`${part.text}\` is blocked by the user's permission rules${v.reason ? `: ${v.reason}` : ''}`)
+          const cd = /^cd\s+(['"]?)([^'"]+)\1$/.exec(part.text)
+          if (v.decision === 'allow') hows.push('allowed by rule')
+          else if (cd) {
+            // cd into a folder Claude may read; later parts run there
+            const target = expand(cfg, cd[2]!)
+            const to = isAbsolute(target) ? target : `${dir}/${target}`
+            try {
+              await checkedPath(io, cfg, to, 'read')
+              dir = normalize(to)
+              hows.push('read-only default')
+            } catch {
+              fresh.push(part)
+              neverRemember = true
+            }
+          } else if (isReadOnlyDefault(part.text) || SAFE_PARTS.some(re => re.test(part.text)) || isPipeFilter(part)) hows.push('read-only default')
+          else {
+            const hit = remembered.find(p => matchesRemembered(p, part.text))
+            if (hit !== undefined) hows.push(`remembered approval: ${hit}`)
+            else {
+              fresh.push(part)
+              // Piping into a shell or interpreter runs whatever came before: never remembered
+              if (part.afterPipe && INTERPRETERS.has(part.text.split(/\s+/)[0]!)) neverRemember = true
+            }
+          }
+        }
+      } else {
+        // Syntax that isn't judged in parts: only an exact remembered approval counts
+        const hit = remembered.find(p => p === command.trim())
+        if (hit !== undefined) hows.push(`remembered approval: ${hit}`)
+        else fresh.push({ text: command.trim(), afterPipe: false })
+      }
+      if (fresh.length === 0) {
+        how = [...new Set(hows)].join(' + ')
       } else {
         const t = UI[await io.lang()]
-        const pattern = rememberPattern(command)
-        const shown = pattern.length > 60 ? `${pattern.slice(0, 57)}…` : pattern
-        const always = t.askAlways(`\`${shown}\``)
-        const answer = await io.ask(t.askCommand(project, command), [t.askOnce, always, t.askDeny], 'DeepSeek')
-        if (answer === always) {
-          projects[project] = [...(projects[project] ?? []).filter(p => p !== pattern), pattern]
+        const patterns = parts ? fresh.map(p => rememberPattern(p.text)) : [command.trim()]
+        const label = patterns.map(p => `\`${p.length > 50 ? `${p.slice(0, 47)}…` : p}\``).join(', ')
+        const always = t.askAlways(label)
+        const options = neverRemember ? [t.askOnce, t.askDeny] : [t.askOnce, always, t.askDeny]
+        const answer = await io.ask(t.askCommand(project, command), options, 'DeepSeek')
+        if (answer === always && !neverRemember) {
+          projects[project] = [...remembered.filter(p => !patterns.includes(p)), ...patterns]
           await saveAllowed(io, cfg.home, projects)
-          how = `approved by the user, remembered: ${pattern}`
+          how = `approved by the user, remembered: ${patterns.join(', ')}`
         } else if (answer === t.askOnce) {
           approvedThisRun.add(command)
           how = 'approved by the user'
@@ -1190,8 +1288,6 @@ async function agent(io: IO, cfg: Config, a: Args) {
           return refuse(`the user declined and said: ${answer}`)
         }
       }
-    } else if (approvedThisRun.has(command)) {
-      how = 'approved by the user'
     }
     try {
       const r = await io.run(await shellArgv(io, command), COMMAND_TIMEOUT_MS)
