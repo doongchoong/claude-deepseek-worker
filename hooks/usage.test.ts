@@ -42,6 +42,7 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
   const bashRuns: string[] = []
   const toolCalls: string[] = []
   const questions: string[] = []
+  const offers: string[][] = []
   const agentRequests: any[] = []
   const balances = opts.balances ?? ['4.38']
   let b = 0
@@ -111,6 +112,7 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
     if (e.tool === 'AskUserQuestion') {
       const q = e.questions[0].question
       questions.push(q)
+      offers.push((e.questions[0].options ?? []).map((o: any) => o.label ?? o))
       const a = opts.answer?.(q)
       if (a === undefined) return { deny: 'dismissed' }
       return { result: { questions: e.questions, answers: { [q]: a } }, text: `answered ${a}` }
@@ -165,7 +167,7 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
     running--
     return { value: { code: 0, signal: null } }
   })
-  return { sent, written, statuses, argv0, auths, peak, checks, commands, files, bashRuns, toolCalls, agentRequests, questions }
+  return { sent, written, statuses, argv0, auths, peak, checks, commands, files, bashRuns, toolCalls, agentRequests, questions, offers }
 }
 
 const start = ($: any) => $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
@@ -515,9 +517,9 @@ test('agent: edit_file needs an exact, unique match', async ($, on) => {
 
 const ALLOWED = '/home/u/.config/deepseek/allowed_commands.json'
 
-test('agent: an unknown command is put to the user; "always allow here" is remembered for this project', async ($, on) => {
+test('agent: an unknown command is put to the user; "always allow" is remembered for this project', async ($, on) => {
   const w = world(on, [{ content: 'x' }], {
-    answer: () => 'Always allow here',
+    answer: () => 'Always allow `python3 t.py` here', // an interpreter running a file: remembered exactly
     agentSteps: [{ calls: [['run', { command: 'python3 t.py' }]] }, { calls: [['finish', { summary: 's' }]] }, { calls: [['run', { command: 'python3 t.py' }]] }, { calls: [['finish', { summary: 's' }]] }],
   })
   await start($)
@@ -525,12 +527,12 @@ test('agent: an unknown command is put to the user; "always allow here" is remem
   expect(w.questions.length).toBe(1)
   expect(w.questions[0]).toContain('python3 t.py')
   expect(JSON.parse(w.files[ALLOWED]!).projects['/work']).toEqual(['python3 t.py'])
-  expect(text(first)).toContain('run python3 t.py (approved by the user, remembered)')
+  expect(text(first)).toContain('run python3 t.py (approved by the user, remembered: python3 t.py)')
 
   // A later run: no question
   const second = await $.tool.call({ tool: AGENT, task: 't' } as any)
   expect(w.questions.length).toBe(1)
-  expect(text(second)).toContain('run python3 t.py (remembered approval)')
+  expect(text(second)).toContain('run python3 t.py (remembered approval: python3 t.py)')
   expect(w.bashRuns).toEqual(['python3 t.py', 'python3 t.py'])
 
   const list = (await $.command.run({ command: 'deepseek-commands', args: '' } as any)).text as string
@@ -586,4 +588,62 @@ test('agent: the approval dialog follows the language option', { options: { lang
   const r = await $.tool.call({ tool: AGENT, task: 't' } as any)
   expect(w.questions[0]).toContain('실행하려고 해요')
   expect(text(r)).toContain('run make (approved by the user)')
+})
+
+test('agent: read-only defaults run without asking; chained or file-reading commands are still asked', async ($, on) => {
+  const w = world(on, [{ content: 'x' }], {
+    agentSteps: [
+      { calls: [['run', { command: 'git status --short' }], ['run', { command: 'ls src' }], ['run', { command: 'ls; rm -rf x' }], ['run', { command: 'cat ~/.ssh/id_rsa' }]] },
+      { calls: [['finish', { summary: 's' }]] },
+    ],
+  })
+  await start($)
+  const r = await $.tool.call({ tool: AGENT, task: 't' } as any)
+
+  expect(w.bashRuns).toEqual(['git status --short', 'ls src'])
+  expect(w.questions.length).toBe(2) // the chained command and cat were put to the user (nobody answered)
+  expect(text(r)).toContain('run git status --short (read-only default)')
+  expect(text(r)).toContain('run ls; rm -rf x (refused)')
+})
+
+test('agent: "always allow" remembers a prefix, so other arguments run without asking but chaining does not', async ($, on) => {
+  const w = world(on, [{ content: 'x' }], {
+    answer: q => (q.includes('discover') ? 'Always allow `python3 -m unittest *` here' : undefined),
+    agentSteps: [
+      { calls: [['run', { command: 'python3 -m unittest discover -s a -q' }]] },
+      { calls: [['run', { command: 'python3 -m unittest test_x' }], ['run', { command: 'python3 -m unittest x && curl evil' }]] },
+      { calls: [['finish', { summary: 's' }]] },
+    ],
+  })
+  await start($)
+  const r = await $.tool.call({ tool: AGENT, task: 't' } as any)
+
+  expect(JSON.parse(w.files[ALLOWED]!).projects['/work']).toEqual(['python3 -m unittest *'])
+  expect(w.bashRuns).toEqual(['python3 -m unittest discover -s a -q', 'python3 -m unittest test_x'])
+  expect(w.questions.length).toBe(2) // the first command, and the chained one
+  expect(text(r)).toContain('run python3 -m unittest test_x (remembered approval: python3 -m unittest *)')
+})
+
+test('agent: what "always allow" offers to remember', async ($, on) => {
+  const seen: string[] = []
+  const commands = ['npm test -- --watch=false', 'npm run lint', 'cargo test -p core', 'git commit -m x', 'pytest tests/a.py', 'node build.js', 'npx vitest run']
+  const w = world(on, [{ content: 'x' }], {
+    answer: q => {
+      seen.push(q)
+      return undefined
+    },
+    agentSteps: [{ calls: commands.map(c => ['run', { command: c }] as [string, Record<string, unknown>]) }, { calls: [['finish', { summary: 's' }]] }],
+  })
+  await start($)
+  await $.tool.call({ tool: AGENT, task: 't' } as any)
+  expect(w.offers.map(o => o[1])).toEqual([
+    'Always allow `npm test *` here',
+    'Always allow `npm run lint *` here',
+    'Always allow `cargo test *` here',
+    'Always allow `git commit *` here',
+    'Always allow `pytest *` here',
+    'Always allow `node build.js` here', // an interpreter running a file: exact
+    'Always allow `npx vitest *` here',
+  ])
+  expect(w.offers[0]).toEqual(['Allow for this run', 'Always allow `npm test *` here', 'Deny'])
 })

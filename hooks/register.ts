@@ -136,7 +136,7 @@ const UI = {
     keyFailed: (msg: string) => `Key check failed: ${msg}`,
     askCommand: (dir: string, command: string) => `The DeepSeek agent wants to run this command in ${dir}:\n\n${command}\n\nAllow it?`,
     askOnce: 'Allow for this run',
-    askAlways: 'Always allow here',
+    askAlways: (pattern: string) => `Always allow ${pattern} here`,
     askDeny: 'Deny',
     commandsNone: (dir: string) => `No commands remembered for ${dir}.`,
     commandsList: (dir: string, list: string[], file: string) =>
@@ -166,7 +166,7 @@ const UI = {
     keyFailed: (msg: string) => `키 확인 실패: ${msg}`,
     askCommand: (dir: string, command: string) => `DeepSeek 에이전트가 ${dir}에서 이 명령을 실행하려고 해요:\n\n${command}\n\n허용할까요?`,
     askOnce: '이번 작업에만 허용',
-    askAlways: '여기서 항상 허용',
+    askAlways: (pattern: string) => `여기서 ${pattern} 항상 허용`,
     askDeny: '거부',
     commandsNone: (dir: string) => `${dir}에서 기억해 둔 명령이 없어요.`,
     commandsList: (dir: string, list: string[], file: string) =>
@@ -870,6 +870,44 @@ async function saveAllowed(io: IO, home: string, projects: Record<string, string
   await io.write(allowedFile(home), JSON.stringify({ projects }, null, 2) + '\n')
 }
 
+// Shell syntax that chains, pipes, redirects or substitutes: a command with any of it is never matched
+// by a default or a remembered prefix, only asked about (or matched exactly)
+const SHELL_SYNTAX = /[;&|<>`$\\\n\r(){}*?!]/
+
+// Read-only commands that run without asking. File readers (cat, head, tail) are left out on purpose:
+// they would read past the permission checks read_file applies, and the output goes to DeepSeek.
+const READ_ONLY_DEFAULTS = [/^pwd$/, /^ls(\s+[\w./~-]+)*$/, /^git status(\s+(--short|-s|-b|--branch))*$/, /^git diff (--stat|--name-only)$/, /^git log --oneline(\s+-n\s*\d+|\s+-\d+)?$/]
+const isReadOnlyDefault = (command: string) => !SHELL_SYNTAX.test(command) && READ_ONLY_DEFAULTS.some(re => re.test(command.trim()))
+
+// Programs that run whatever file they are given: remembered only as the exact command, unless run as `-m module`
+const INTERPRETERS = new Set(['python', 'python3', 'node', 'ruby', 'perl', 'php', 'sh', 'bash', 'zsh', 'deno', 'bun', 'pwsh', 'powershell', 'cmd'])
+// Tools whose second word is the subcommand (npm test, cargo test, go test, make check, npx vitest)
+const SUBCOMMAND_TOOLS = new Set(['git', 'docker', 'kubectl', 'gh', 'npm', 'pnpm', 'yarn', 'cargo', 'go', 'make', 'dotnet', 'mvn', 'gradle', './gradlew', 'npx', 'pnpx', 'bunx', 'uvx', 'uv', 'poetry', 'tox', 'nox', 'just', 'rake', 'bundle', 'mix', 'swift', 'flutter', 'dart'])
+
+// What "always allow" remembers for a command: a prefix pattern such as `npm test *` or `python3 -m unittest *`,
+// or the exact command when no safe prefix exists
+function rememberPattern(command: string) {
+  const c = command.trim()
+  if (SHELL_SYNTAX.test(c)) return c
+  const w = c.split(/\s+/)
+  const word = (x: string | undefined) => !!x && /^[A-Za-z][\w:-]*$/.test(x)
+  if (INTERPRETERS.has(w[0]!)) return w[1] === '-m' && word(w[2]) ? `${w.slice(0, 3).join(' ')} *` : c
+  if (SUBCOMMAND_TOOLS.has(w[0]!)) {
+    if (!word(w[1])) return c
+    // npm run test, yarn run lint, uv run pytest: keep the script name too
+    if (w[1] === 'run' || w[1] === 'exec') return word(w[2]) ? `${w.slice(0, 3).join(' ')} *` : c
+    return `${w.slice(0, 2).join(' ')} *`
+  }
+  return /^[A-Za-z][\w.-]*$/.test(w[0]!) ? `${w[0]} *` : c
+}
+
+const matchesRemembered = (pattern: string, command: string) => {
+  const c = command.trim()
+  if (!pattern.endsWith(' *')) return pattern === c
+  const base = pattern.slice(0, -2)
+  return !SHELL_SYNTAX.test(c) && (c === base || c.startsWith(`${base} `))
+}
+
 // A shell by absolute path: /bin/sh, or cmd.exe on Windows
 async function shellArgv(io: IO, command: string) {
   const root = await io.env('SystemRoot')
@@ -981,18 +1019,24 @@ async function agent(io: IO, cfg: Config, a: Args) {
     const verdict = await io.checkCommand(command)
     if (verdict.decision === 'deny') return refuse(`blocked by the user's permission rules${verdict.reason ? `: ${verdict.reason}` : ''}`)
     let how = 'allowed by rule'
-    if (verdict.decision !== 'allow' && !approvedThisRun.has(command)) {
+    if (verdict.decision !== 'allow' && isReadOnlyDefault(command)) {
+      how = 'read-only default'
+    } else if (verdict.decision !== 'allow' && !approvedThisRun.has(command)) {
       const projects = await loadAllowed(io, cfg.home)
       const project = await realDir(io, cwd)
-      if ((projects[project] ?? []).includes(command)) {
-        how = 'remembered approval'
+      const hit = (projects[project] ?? []).find(p => matchesRemembered(p, command))
+      if (hit !== undefined) {
+        how = `remembered approval: ${hit}`
       } else {
         const t = UI[await io.lang()]
-        const answer = await io.ask(t.askCommand(rel(project) === project ? project : rel(project), command), [t.askOnce, t.askAlways, t.askDeny], 'DeepSeek')
-        if (answer === t.askAlways) {
-          projects[project] = [...(projects[project] ?? []), command]
+        const pattern = rememberPattern(command)
+        const shown = pattern.length > 60 ? `${pattern.slice(0, 57)}…` : pattern
+        const always = t.askAlways(`\`${shown}\``)
+        const answer = await io.ask(t.askCommand(project, command), [t.askOnce, always, t.askDeny], 'DeepSeek')
+        if (answer === always) {
+          projects[project] = [...(projects[project] ?? []).filter(p => p !== pattern), pattern]
           await saveAllowed(io, cfg.home, projects)
-          how = 'approved by the user, remembered'
+          how = `approved by the user, remembered: ${pattern}`
         } else if (answer === t.askOnce) {
           approvedThisRun.add(command)
           how = 'approved by the user'
