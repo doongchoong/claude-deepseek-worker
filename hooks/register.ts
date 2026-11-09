@@ -962,6 +962,22 @@ const LINE_CHARS = 500
 const TOOL_OUT_CHARS = 8_000
 const TRAIL_MAX = 40
 const COMMAND_TIMEOUT_MS = 300_000
+// Sites named in the task (as python.org, or inside a URL) that web_fetch may open any page of.
+// A bare name counts only with a common ending, so a file name such as textstats.py (.py is a country domain) doesn't.
+const SITE_ENDINGS = 'com|org|net|io|dev|ai|app|co|gov|edu|info|me|sh|rs|so|cloud|site|tech|page|xyz|jp|kr|uk|de|fr|cn|eu|ca|au|in'
+function taskSites(task: string): string[] {
+  const hosts = [...task.matchAll(/https?:\/\/([^\/\s?#:<>"')\]]+)/gi)].map(m => m[1]!.toLowerCase())
+  const bare = [...task.matchAll(new RegExp(`(?<![\\w./@-])((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+(?:${SITE_ENDINGS}))(?![\\w.-]*[\\w])`, 'gi'))].map(m => m[1]!.toLowerCase())
+  return [...new Set([...hosts, ...bare].map(h => h.replace(/^www\./, '')))]
+}
+
+const hostOf = (url: string) => /^https?:\/\/([^\/?#:]+)/i.exec(url)?.[1]?.toLowerCase()
+// A URL is on a site when its host is the site or a subdomain of it (www.python.org is on python.org)
+const onSite = (url: string, sites: string[]) => {
+  const h = hostOf(url)
+  return !!h && sites.some(s => h === s || h.endsWith(`.${s}`))
+}
+
 const AGENT_MAX_SEARCHES = 8
 const AGENT_MAX_FETCHES = 4
 
@@ -1035,7 +1051,7 @@ const AGENT_SYSTEM = `You work on your own in a code repository, using tools, to
 - Use run for tests and other checks. Don't run commands that change things beyond the task: no installing, deleting, git commits or network access.
 - Commands may need the user's approval. If one is refused, don't run it again or a variant of it; check by reading the code instead, and say in the summary what you could not run.
 - If a verification command is given, run it before you finish and fix what fails. Never weaken, skip or delete tests to make them pass.
-- When you need current documentation or facts you don't know, use web_search, then web_fetch for a page. web_fetch only opens URLs from your search results or from the task. Searches cost money: search only when it matters.
+- When you need current documentation or facts you don't know, use web_search, then web_fetch for a page. web_fetch opens URLs from your search results and any page on a site named in the task. Searches cost money: search only when it matters.
 - When you are done, or stuck, call finish once with a short summary (at most 15 lines): what you changed, how you verified it, and anything left undone. No code in the summary.`
 
 const fn = (name: string, description: string, properties: Record<string, unknown>, required: string[]) => ({
@@ -1111,9 +1127,10 @@ async function agent(io: IO, cfg: Config, a: Args) {
   let turns = 0
   let searches = 0
   let fetches = 0
-  // web_fetch may open only these: URLs from search results, and URLs written in the task.
+  // web_fetch may open only these: URLs from search results, and any page of a site named in the task.
   // A page or file can't make DeepSeek send data out by asking it to fetch a URL it made up.
-  const openable = new Set<string>(task.match(/https?:\/\/[^\s<>"')\]]+/g) ?? [])
+  const openable = new Set<string>()
+  const sites = taskSites(task)
 
   const step = async (withTools: boolean) => {
     const body: Record<string, unknown> = { model, messages, reasoning_effort: effort }
@@ -1299,7 +1316,8 @@ async function agent(io: IO, cfg: Config, a: Args) {
       }
       case 'web_fetch': {
         const url = String(x.url ?? '')
-        if (!openable.has(url)) return 'refused: web_fetch only opens URLs that appeared in your search results or in the task.'
+        if (!openable.has(url) && !onSite(url, sites))
+          return `refused: web_fetch only opens URLs from your search results or pages on sites named in the task${sites.length ? ` (${sites.join(', ')})` : ''}.`
         if (fetches >= AGENT_MAX_FETCHES) return 'Page read limit reached for this task. Work with what you have.'
         fetches++
         trail.push(`fetch ${url}`)
@@ -1497,7 +1515,7 @@ Cost: $0.75 per 1,000 successful searches and per 1,000 page reads, plus tokens.
     description: `Hands one contained coding task to DeepSeek working as a small agent: it looks around the repository, edits files and runs checks on its own, then returns a short report.
 
 Inside, DeepSeek has glob, grep, read_file, write_file, edit_file, run, web_search and web_fetch. Reads and writes follow Claude Code's permissions like files/output_path.
-Web: DeepSeek's own search (up to ${AGENT_MAX_SEARCHES} searches and ${AGENT_MAX_FETCHES} page reads per task, billed per request); web_fetch only opens URLs from its search results or written in the task.
+Web: DeepSeek's own search (up to ${AGENT_MAX_SEARCHES} searches and ${AGENT_MAX_FETCHES} page reads per task, billed per request); web_fetch opens URLs from its search results and any page on a site named in the task (python.org, or a URL's host), nothing else. Name the sites to use in the task.
 Everything DeepSeek reads (files, output, pages) is wrapped in a random boundary and marked as material, not instructions.
 Its grep and glob run through Claude Code's own Grep and Glob tools, or, in a session without them, through the plugin's own search with the same permission checks per file. A command runs at once if the user's permission rules allow it, or if the user approved it for this project before; otherwise the user is asked in a dialog (allow for this run, always allow here, or deny). Deny rules always win.
 task: the goal, scope and what done means. files: files to put in front from the start (saves exploring).
