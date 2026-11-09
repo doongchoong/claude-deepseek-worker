@@ -4,3 +4,4 @@ __pycache__/
 *.log
 .claude-plugin/types/
 .mcpb-cache/
+.claude/settings.local.json

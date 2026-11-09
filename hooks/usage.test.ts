@@ -18,8 +18,12 @@ type WorldOptions = {
   files?: Record<string, string>
   // deepseek_agent: DeepSeek's message per turn (non-streaming requests), in order
   agentSteps?: AgentStep[]
-  // Claude Code's Bash tool: the answer per command (default: passes with "ok")
-  bash?: (command: string) => { deny?: string; text?: string; isError?: boolean }
+  // What a shell command prints and its exit code (default: exit 0, "ok")
+  bash?: (command: string) => { stdout?: string; stderr?: string; exitCode?: number }
+  // Claude Code's permission rules for a shell command (default: ask)
+  bashRule?: (command: string) => 'allow' | 'deny' | 'ask'
+  // The user's answer in the approval dialog (default: no answer, as when nobody can be asked)
+  answer?: (question: string) => string | undefined
 }
 
 type AgentStep = { calls?: [string, Record<string, unknown>][]; content?: string }
@@ -37,6 +41,7 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
   const files: Record<string, string> = { ...opts.files }
   const bashRuns: string[] = []
   const toolCalls: string[] = []
+  const questions: string[] = []
   const agentRequests: any[] = []
   const balances = opts.balances ?? ['4.38']
   let b = 0
@@ -64,6 +69,11 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
   // are allowed, writes in the working folder are ask (as in the default mode), anything else is ask
   const checks: string[] = []
   on('tool.check', (_: unknown, e: any) => {
+    if (e.tool === 'Bash') {
+      checks.push(`Bash ${e.input.command}`)
+      const d = opts.bashRule?.(e.input.command) ?? 'ask'
+      return d === 'deny' ? { decision: 'deny', reason: 'rule Bash(rm:*)' } : { decision: d }
+    }
     const path: string = e.input.file_path
     checks.push(`${e.tool} ${path}`)
     if (path.startsWith('/tmp/scratch/')) return { decision: 'allow' }
@@ -98,16 +108,25 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
   })
   // Claude Code's own tools that deepseek_agent borrows; everything else passes through
   on('tool.call', (_: unknown, e: any, next: any) => {
-    if (e.tool === 'Bash') {
-      bashRuns.push(e.command)
-      const a = opts.bash?.(e.command) ?? { text: 'ok' }
-      return a.deny !== undefined ? { deny: a.deny } : { result: {}, text: a.text ?? '', isError: a.isError }
+    if (e.tool === 'AskUserQuestion') {
+      const q = e.questions[0].question
+      questions.push(q)
+      const a = opts.answer?.(q)
+      if (a === undefined) return { deny: 'dismissed' }
+      return { result: { questions: e.questions, answers: { [q]: a } }, text: `answered ${a}` }
     }
     if (e.tool === 'Grep' || e.tool === 'Glob') {
       toolCalls.push(`${e.tool} ${e.pattern} ${e.path}`)
       return { result: {}, text: `${e.tool} result` }
     }
     return next(e)
+  })
+  // Commands the agent runs: /bin/sh -c <command>
+  on('process.run', (_: unknown, e: any) => {
+    const command = e.argv[2]
+    bashRuns.push(command)
+    const a = opts.bash?.(command) ?? {}
+    return { value: { exitCode: a.exitCode ?? 0, stdout: a.stdout ?? 'ok', stderr: a.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   // Generation comes through curl streaming: take the body from the curl config on stdin and answer in SSE chunks
   on('process.spawn', async function* (_: unknown, e: any) {
@@ -146,7 +165,7 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
     running--
     return { value: { code: 0, signal: null } }
   })
-  return { sent, written, statuses, argv0, auths, peak, checks, commands, files, bashRuns, toolCalls, agentRequests }
+  return { sent, written, statuses, argv0, auths, peak, checks, commands, files, bashRuns, toolCalls, agentRequests, questions }
 }
 
 const start = ($: any) => $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
@@ -390,7 +409,8 @@ const AGENT = 'mcp__deepseek-worker__deepseek_agent'
 test('agent: reads, edits and runs the check; the plugin reuses that run when nothing changed after it', async ($, on) => {
   const w = world(on, [{ content: 'x' }], {
     files: { '/work/a.py': 'def f():\n    return 1\n' },
-    bash: () => ({ text: '3 passed' }),
+    bashRule: c => (c === 'pytest' ? 'allow' : 'ask'),
+    bash: () => ({ stdout: '3 passed' }),
     agentSteps: [
       { calls: [['grep', { pattern: 'def f' }], ['read_file', { path: 'a.py' }]] },
       { calls: [['edit_file', { path: 'a.py', old_string: 'return 1', new_string: 'return 2' }]] },
@@ -408,7 +428,8 @@ test('agent: reads, edits and runs the check; the plugin reuses that run when no
   expect(text(r)).toContain('Changed f to return 2.')
   expect(text(r)).toContain('- a.py (2 → 2 lines)')
   expect(text(r)).toContain('check: pytest → passed')
-  expect(text(r)).toContain('steps: grep def f; read a.py; edit a.py; run pytest')
+  expect(text(r)).toContain('steps: grep def f; read a.py; edit a.py; run pytest (allowed by rule)')
+  expect(w.questions).toEqual([]) // an allow rule needs no question
   expect(text(r)).toContain('[usage: deepseek-flash, in=400 out=80]')
   expect(w.agentRequests[0].tools.map((t: any) => t.function.name)).toContain('edit_file')
   expect(w.agentRequests[0].messages[1].content).toContain('Verification command (run it before you finish): pytest')
@@ -418,7 +439,8 @@ test('agent: reads, edits and runs the check; the plugin reuses that run when no
 test('agent: the plugin runs the check itself when files changed after the last run', async ($, on) => {
   let n = 0
   const w = world(on, [{ content: 'x' }], {
-    bash: () => (n++ === 0 ? { text: '1 failed', isError: true } : { text: '1 passed' }),
+    bashRule: () => 'allow',
+    bash: () => (n++ === 0 ? { stdout: '1 failed', exitCode: 1 } : { stdout: '1 passed' }),
     agentSteps: [
       { calls: [['run', { command: 'npm test' }]] },
       { calls: [['write_file', { path: 'src/new.ts', content: 'export const x = 1\n' }]] },
@@ -431,12 +453,12 @@ test('agent: the plugin runs the check itself when files changed after the last 
   expect(w.bashRuns).toEqual(['npm test', 'npm test'])
   expect(text(r)).toContain('- src/new.ts (new, 1 lines)')
   expect(text(r)).toContain('check: npm test → passed')
-  expect(text(r)).toContain('run npm test (failed)')
+  expect(text(r)).toContain('run npm test (allowed by rule, failed)')
 })
 
 test('agent: commands the user refuses, deny-ruled files and paths outside are reported back, not done', async ($, on) => {
   const w = world(on, [{ content: 'x' }], {
-    bash: c => (c.startsWith('rm') ? { deny: 'The user declined' } : { text: 'ok' }),
+    bashRule: c => (c.startsWith('rm') ? 'deny' : 'ask'),
     agentSteps: [
       { calls: [['run', { command: 'rm -rf build' }], ['read_file', { path: '.env' }], ['write_file', { path: '/etc/x', content: 'y' }]] },
       { calls: [['finish', { summary: 'Could not do it.' }]] },
@@ -446,12 +468,15 @@ test('agent: commands the user refuses, deny-ruled files and paths outside are r
   const r = await $.tool.call({ tool: AGENT, task: 't', check_command: 'rm -rf build' } as any)
 
   const results = w.agentRequests[1].messages.filter((m: any) => m.role === 'tool').map((m: any) => m.content)
-  expect(results[0]).toContain('refused by the user')
+  expect(results[0]).toContain("refused: blocked by the user's permission rules")
+  expect(w.bashRuns).toEqual([]) // nothing ran
+  expect(w.questions).toEqual([]) // a deny rule is never put to the user
   expect(results[1]).toContain("permission settings block it")
   expect(results[2]).toContain('outside the working folder')
   expect(w.files['/etc/x']).toBeUndefined()
   expect(text(r)).toContain('changed:\n- (none)')
-  expect(text(r)).toContain('check: rm -rf build → refused')
+  expect(text(r)).toContain('check: rm -rf build → not run (')
+  expect(text(r)).toContain('Run it yourself to verify.')
 })
 
 test('agent: stops at max_turns and asks for a summary without tools', async ($, on) => {
@@ -484,4 +509,81 @@ test('agent: edit_file needs an exact, unique match', async ($, on) => {
   expect(first[0]).toContain('old_string not found')
   expect(first[1]).toContain('appears 2 times')
   expect(w.files['/work/b.txt']).toBe('y\ny\n')
+})
+
+// ───────── deepseek_agent: commands outside the rules ─────────
+
+const ALLOWED = '/home/u/.config/deepseek/allowed_commands.json'
+
+test('agent: an unknown command is put to the user; "always allow here" is remembered for this project', async ($, on) => {
+  const w = world(on, [{ content: 'x' }], {
+    answer: () => 'Always allow here',
+    agentSteps: [{ calls: [['run', { command: 'python3 t.py' }]] }, { calls: [['finish', { summary: 's' }]] }, { calls: [['run', { command: 'python3 t.py' }]] }, { calls: [['finish', { summary: 's' }]] }],
+  })
+  await start($)
+  const first = await $.tool.call({ tool: AGENT, task: 't' } as any)
+  expect(w.questions.length).toBe(1)
+  expect(w.questions[0]).toContain('python3 t.py')
+  expect(JSON.parse(w.files[ALLOWED]!).projects['/work']).toEqual(['python3 t.py'])
+  expect(text(first)).toContain('run python3 t.py (approved by the user, remembered)')
+
+  // A later run: no question
+  const second = await $.tool.call({ tool: AGENT, task: 't' } as any)
+  expect(w.questions.length).toBe(1)
+  expect(text(second)).toContain('run python3 t.py (remembered approval)')
+  expect(w.bashRuns).toEqual(['python3 t.py', 'python3 t.py'])
+
+  const list = (await $.command.run({ command: 'deepseek-commands', args: '' } as any)).text as string
+  expect(list).toContain('python3 t.py')
+  const cleared = (await $.command.run({ command: 'deepseek-commands', args: 'clear' } as any)).text as string
+  expect(cleared).toContain('Forgot')
+  expect(JSON.parse(w.files[ALLOWED]!).projects['/work']).toBeUndefined()
+})
+
+test('agent: "allow for this run" covers the final check too, without being remembered', async ($, on) => {
+  const w = world(on, [{ content: 'x' }], {
+    answer: () => 'Allow for this run',
+    agentSteps: [
+      { calls: [['run', { command: 'make check' }]] },
+      { calls: [['write_file', { path: 'x.txt', content: 'y\n' }]] },
+      { calls: [['finish', { summary: 's' }]] },
+    ],
+  })
+  await start($)
+  const r = await $.tool.call({ tool: AGENT, task: 't', check_command: 'make check' } as any)
+
+  expect(w.questions.length).toBe(1)
+  expect(w.bashRuns).toEqual(['make check', 'make check']) // DeepSeek's run, then the plugin's final check
+  expect(text(r)).toContain('check: make check → passed')
+  expect(w.files[ALLOWED]).toBeUndefined()
+})
+
+test('agent: a declined or unanswered command is refused once, and retries are cut off without asking again', async ($, on) => {
+  const w = world(on, [{ content: 'x' }], {
+    agentSteps: [
+      { calls: [['run', { command: 'python3 -c 1' }]] },
+      { calls: [['run', { command: 'python3 -c 1' }]] },
+      { calls: [['finish', { summary: 'Could not run it.' }]] },
+    ],
+  })
+  await start($)
+  const r = await $.tool.call({ tool: AGENT, task: 't', check_command: 'python3 -c 1' } as any)
+
+  const second = w.agentRequests[2].messages.filter((m: any) => m.role === 'tool').map((m: any) => m.content)
+  expect(w.questions.length).toBe(1) // nobody answered; not asked again
+  expect(second[1]).toContain("already refused in this run")
+  expect(w.bashRuns).toEqual([])
+  expect(text(r)).toContain('check: python3 -c 1 → not run (already refused')
+  expect(w.agentRequests[0].messages[0].content).toContain("If one is refused, don't run it again")
+})
+
+test('agent: the approval dialog follows the language option', { options: { language: 'ko' } }, async ($, on) => {
+  const w = world(on, [{ content: 'x' }], {
+    answer: () => '이번 작업에만 허용',
+    agentSteps: [{ calls: [['run', { command: 'make' }]] }, { calls: [['finish', { summary: 's' }]] }],
+  })
+  await start($)
+  const r = await $.tool.call({ tool: AGENT, task: 't' } as any)
+  expect(w.questions[0]).toContain('실행하려고 해요')
+  expect(text(r)).toContain('run make (approved by the user)')
 })

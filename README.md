@@ -20,10 +20,11 @@ You ──▶ Claude (plans, reviews) ──▶ deepseek_chat / batch / agent / 
 | --- | --- |
 | `deepseek_chat` | One task. `files` are read by the plugin and prepended, so Claude doesn't copy file contents into the call. `output_path` writes the answer straight to a file and returns only path and line count. |
 | `deepseek_batch` | Many independent prompts in parallel, results in order. |
-| `deepseek_agent` | A small agent: DeepSeek looks around the repo, edits files and runs a check command on its own, then returns a short report (summary, changed files, check verdict). Its commands, grep and glob go through Claude Code's own Bash, Grep and Glob tools, so your permission rules and approval dialog apply. Costs more than `deepseek_chat`. |
+| `deepseek_agent` | A small agent: DeepSeek looks around the repo, edits files and runs a check command on its own, then returns a short report (summary, changed files, check verdict). Commands it wants to run follow your permission rules: an allowed command runs, a denied one never does, and anything else is put to you in a dialog (allow for this run, always allow in this project, or deny). Costs more than `deepseek_chat`. |
 | `deepseek_research` | DeepSeek searches and reads the web on its own, several rounds, and returns only a sourced summary. |
 | `deepseek_models` | Lists available models. |
 | Status line | `deepseek-worker 7 calls 128.5Ktok hit 62% $4.38` — calls, tokens, cache hit rate and account balance for the session. |
+| `/deepseek-commands` | Lists the commands you chose to always allow for the DeepSeek agent in this project; `/deepseek-commands clear` forgets them. |
 | `/deepseek-usage` | Detailed usage for the session: cached / uncached input, output, reasoning, balance spent. Before the first call it checks the key and shows the balance (free). |
 | Guidance for Claude | When to delegate and when to do it itself, and how to keep DeepSeek's prompt cache warm — added to Claude's system prompt. |
 
@@ -40,6 +41,7 @@ Safety details that matter when a worker writes your files:
 - Generation requests run through the system's own `curl` by absolute path (`/usr/bin/curl`, or `%SystemRoot%\System32\curl.exe` on Windows), not whatever `curl` comes first on `PATH`. They take longer than the 30 seconds Claude Code's built-in fetch allows, and are streamed so a long answer arrives whole. Because `curl` is a separate process, those requests don't pass through Claude Code's own network policy.
 - Everything you put in a prompt or `files` is sent to DeepSeek's servers. Keep secrets and data you may not share out of it.
 - Web research returns text written by web pages; Claude treats it as information, not instructions.
+- **Commands from `deepseek_agent`.** The plugin asks Claude Code's permission rules first: a deny rule always wins, and an allow rule (say `Bash(npm test:*)`) runs the command without asking. Anything else is put to you in a dialog. "Always allow here" remembers that exact command for that project folder in `~/.config/deepseek/allowed_commands.json`, outside any project, so a repository can't approve its own commands. Approved commands run through `/bin/sh` (`cmd.exe` on Windows) with a 5-minute limit, **outside Claude Code's Bash sandbox** if you use one. Claude Code's own Bash tool isn't used because, in auto mode, its classifier refuses calls that no request of yours explains. With nobody to answer (a background run), unknown commands are refused, and the agent is told not to retry them.
 
 ## Requirements
 

@@ -28,8 +28,16 @@ type IO = {
   env: (name: EnvName) => Promise<string | undefined>
   // Starts a command and yields its output in pieces (input goes to stdin)
   spawn: (argv: string[], input: string) => AsyncIterable<{ stream: 'stdout' | 'stderr'; text: string }>
-  // Runs one of Claude Code's own tools (Bash, Grep, Glob) through its permission check and dialog
-  callTool: (tool: 'Bash' | 'Grep' | 'Glob', input: Record<string, unknown>) => Promise<{ deny?: string; text?: string; isError?: boolean }>
+  // Runs one of Claude Code's own read-only tools (Grep, Glob) through its permission check
+  callTool: (tool: 'Grep' | 'Glob', input: Record<string, unknown>) => Promise<{ deny?: string; text?: string; isError?: boolean }>
+  // What Claude Code's permission rules say about Claude running this shell command (rules only; no classifier, no dialog)
+  checkCommand: (command: string) => Promise<{ decision: string; reason?: string }>
+  // Runs a program directly (no shell of its own), waiting up to timeoutMs
+  run: (argv: string[], timeoutMs: number) => Promise<{ exitCode: number; stdout: string; stderr: string }>
+  // Asks the user in Claude Code's question dialog; undefined when nobody can answer or it was dismissed
+  ask: (question: string, options: string[], header: string) => Promise<string | undefined>
+  // The language people read
+  lang: () => Promise<Lang>
   record: (used: Used[], bal: Bal | undefined) => Promise<void>
 }
 
@@ -76,6 +84,7 @@ Write it yourself when:
 When delegating, pass reference files with files, save code results with output_path, and review by running tests or reading parts.
 After two failed re-instructions, write it yourself.
 Reviewing deepseek_agent: trust the plugin's check verdict, look at git diff --stat and only the parts that matter; don't re-read every changed file.
+If its check says "not run", run check_command yourself before calling the work done.
 If an agent run fails, don't rerun the same task: narrow it for deepseek_chat, or do it yourself.
 Never run two agents, or an agent and your own edits, on the same files at the same time.
 
@@ -125,6 +134,15 @@ const UI = {
     noKey: (file: string) =>
       `No DeepSeek API key. Set the api_key option of ${PLUGIN} in /plugin, or save the key to ${file}, readable only by you.`,
     keyFailed: (msg: string) => `Key check failed: ${msg}`,
+    askCommand: (dir: string, command: string) => `The DeepSeek agent wants to run this command in ${dir}:\n\n${command}\n\nAllow it?`,
+    askOnce: 'Allow for this run',
+    askAlways: 'Always allow here',
+    askDeny: 'Deny',
+    commandsNone: (dir: string) => `No commands remembered for ${dir}.`,
+    commandsList: (dir: string, list: string[], file: string) =>
+      `Commands the DeepSeek agent may run in ${dir} without asking:\n${list.map(c => `  ${c}`).join('\n')}\n\nForget them with /deepseek-commands clear, or edit ${file}.`,
+    commandsCleared: (dir: string) => `Forgot the remembered commands for ${dir}.`,
+    commandsDescription: 'Show or clear the commands the DeepSeek agent may run here without asking',
   },
   ko: {
     commandDescription: '이 세션의 DeepSeek 워커 토큰 사용량과 계정 잔액을 자세히 보기',
@@ -146,6 +164,15 @@ const UI = {
     noKey: (file: string) =>
       `DeepSeek API 키가 없어요. /plugin 에서 ${PLUGIN}의 api_key 옵션에 넣거나, 본인만 읽을 수 있게 ${file}에 저장하세요.`,
     keyFailed: (msg: string) => `키 확인 실패: ${msg}`,
+    askCommand: (dir: string, command: string) => `DeepSeek 에이전트가 ${dir}에서 이 명령을 실행하려고 해요:\n\n${command}\n\n허용할까요?`,
+    askOnce: '이번 작업에만 허용',
+    askAlways: '여기서 항상 허용',
+    askDeny: '거부',
+    commandsNone: (dir: string) => `${dir}에서 기억해 둔 명령이 없어요.`,
+    commandsList: (dir: string, list: string[], file: string) =>
+      `DeepSeek 에이전트가 ${dir}에서 묻지 않고 실행하는 명령:\n${list.map(c => `  ${c}`).join('\n')}\n\n/deepseek-commands clear 로 지우거나 ${file}을 고치면 돼요.`,
+    commandsCleared: (dir: string) => `${dir}에서 기억해 둔 명령을 지웠어요.`,
+    commandsDescription: 'DeepSeek 에이전트가 이 폴더에서 묻지 않고 실행하는 명령 보기·지우기',
   },
 } satisfies Record<Lang, unknown>
 
@@ -809,8 +836,9 @@ async function research(io: IO, cfg: Config, a: Args) {
 // ───────── Agent: DeepSeek works on its own with a small tool set ─────────
 // One tool to Claude; inside, a loop where DeepSeek looks around, edits and runs checks.
 // Reads and writes go through the same permission and link checks as files/output_path.
-// Commands, grep and glob go through Claude Code's own Bash, Grep and Glob tools, so the user's
-// permission rules and approval dialog apply as they would to Claude.
+// grep and glob go through Claude Code's own Grep and Glob tools. A command runs when a permission rule
+// allows it or the user approved it for this project before; otherwise the user is asked in a dialog.
+// (Claude Code's own Bash tool can't be used: in auto mode its classifier refuses calls no user request explains.)
 
 const AGENT_DEFAULT_TURNS = 12
 const AGENT_MAX_TURNS = 30
@@ -821,12 +849,39 @@ const READ_MAX_LINES = 2000
 const LINE_CHARS = 500
 const TOOL_OUT_CHARS = 8_000
 const TRAIL_MAX = 40
+const COMMAND_TIMEOUT_MS = 300_000
+
+// Commands the user chose to always allow, per project folder. Kept outside any project,
+// so a repository can't approve its own commands.
+const allowedFile = (home: string) => `${configDir(home)}/allowed_commands.json`
+
+async function loadAllowed(io: IO, home: string): Promise<Record<string, string[]>> {
+  try {
+    const file = allowedFile(home)
+    if (!(await io.exists(file))) return {}
+    const data = JSON.parse(await io.read(file))
+    return data && typeof data.projects === 'object' ? data.projects : {}
+  } catch {
+    return {}
+  }
+}
+
+async function saveAllowed(io: IO, home: string, projects: Record<string, string[]>) {
+  await io.write(allowedFile(home), JSON.stringify({ projects }, null, 2) + '\n')
+}
+
+// A shell by absolute path: /bin/sh, or cmd.exe on Windows
+async function shellArgv(io: IO, command: string) {
+  const root = await io.env('SystemRoot')
+  return root ? [`${root.replace(/[\\/]+$/, '')}\\System32\\cmd.exe`, '/d', '/s', '/c', command] : ['/bin/sh', '-c', command]
+}
 
 const AGENT_SYSTEM = `You work on your own in a code repository, using tools, to finish one task given by a higher-level agent (Claude). Claude reviews your work afterwards.
 - Look before you change: find the relevant files with glob and grep, and read what you need with read_file. Read a range rather than a whole large file.
 - Change only what the task needs. Use edit_file for changes to existing files and write_file for new files or full rewrites.
 - Paths are relative to the working folder.
 - Use run for tests and other checks. Don't run commands that change things beyond the task: no installing, deleting, git commits or network access.
+- Commands may need the user's approval. If one is refused, don't run it again or a variant of it; check by reading the code instead, and say in the summary what you could not run.
 - If a verification command is given, run it before you finish and fix what fails. Never weaken, skip or delete tests to make them pass.
 - When you are done, or stuck, call finish once with a short summary (at most 15 lines): what you changed, how you verified it, and anything left undone. No code in the summary.`
 
@@ -874,7 +929,7 @@ async function agent(io: IO, cfg: Config, a: Args) {
     const e = expand(cfg, p || '.')
     return isAbsolute(e) ? e : `${cwd}/${e}`
   }
-  const rel = (p: string) => (p.startsWith(`${cwd}/`) ? p.slice(cwd.length + 1) : p)
+  const rel = (p: string) => (p.startsWith(`${cwd}/`) ? p.slice(cwd.length + 1) : cfg.home && p.startsWith(`${cfg.home}/`) ? `~${p.slice(cfg.home.length)}` : p)
 
   let user = `Task:\n${task}`
   if (check) user += `\n\nVerification command (run it before you finish): ${check}`
@@ -911,10 +966,52 @@ async function agent(io: IO, cfg: Config, a: Args) {
     return resp.choices?.[0]?.message ?? {}
   }
 
-  const runCommand = async (command: string) => {
-    const r = await io.callTool('Bash', { command, description: `deepseek_agent: ${command.slice(0, 60)}` })
-    if (r.deny !== undefined) return { ok: false, refused: true, out: r.deny }
-    return { ok: !r.isError, refused: false, out: r.text ?? '' }
+  // Who let a command run: a permission rule, a remembered approval, or the user just now
+  type Ran = { ok: boolean; refused: boolean; out: string; how: string }
+  const approvedThisRun = new Set<string>()
+  const refusedThisRun = new Map<string, string>()
+  const runCommand = async (command: string): Promise<Ran> => {
+    const before = refusedThisRun.get(command)
+    if (before !== undefined) return { ok: false, refused: true, out: `already refused in this run (${before}); don't retry it`, how: 'refused' }
+    const refuse = (why: string): Ran => {
+      refusedThisRun.set(command, why)
+      return { ok: false, refused: true, out: why, how: 'refused' }
+    }
+    // Rules first: deny always wins; a matching allow rule needs no question
+    const verdict = await io.checkCommand(command)
+    if (verdict.decision === 'deny') return refuse(`blocked by the user's permission rules${verdict.reason ? `: ${verdict.reason}` : ''}`)
+    let how = 'allowed by rule'
+    if (verdict.decision !== 'allow' && !approvedThisRun.has(command)) {
+      const projects = await loadAllowed(io, cfg.home)
+      const project = await realDir(io, cwd)
+      if ((projects[project] ?? []).includes(command)) {
+        how = 'remembered approval'
+      } else {
+        const t = UI[await io.lang()]
+        const answer = await io.ask(t.askCommand(rel(project) === project ? project : rel(project), command), [t.askOnce, t.askAlways, t.askDeny], 'DeepSeek')
+        if (answer === t.askAlways) {
+          projects[project] = [...(projects[project] ?? []), command]
+          await saveAllowed(io, cfg.home, projects)
+          how = 'approved by the user, remembered'
+        } else if (answer === t.askOnce) {
+          approvedThisRun.add(command)
+          how = 'approved by the user'
+        } else if (answer === undefined || answer === t.askDeny) {
+          return refuse('the user declined')
+        } else {
+          return refuse(`the user declined and said: ${answer}`)
+        }
+      }
+    } else if (approvedThisRun.has(command)) {
+      how = 'approved by the user'
+    }
+    try {
+      const r = await io.run(await shellArgv(io, command), COMMAND_TIMEOUT_MS)
+      const out = [r.stdout, r.stderr].filter(Boolean).join(r.stdout && r.stderr ? '\n' : '')
+      return { ok: r.exitCode === 0, refused: false, out: r.exitCode === 0 ? out : `${out}\n[exit code ${r.exitCode}]`, how }
+    } catch (err) {
+      return { ok: false, refused: false, out: `could not run: ${(err as Error).message}`, how }
+    }
   }
 
   // Runs one tool call from DeepSeek and returns what DeepSeek reads back
@@ -968,9 +1065,9 @@ async function agent(io: IO, cfg: Config, a: Args) {
       case 'run': {
         const command = String(x.command ?? '')
         const r = await runCommand(command)
-        trail.push(`run ${command}${r.refused ? ' (refused)' : r.ok ? '' : ' (failed)'}`)
+        trail.push(`run ${command} (${r.refused ? 'refused' : r.ok ? r.how : `${r.how}, failed`})`)
         if (!r.refused) lastRun = { command, ok: r.ok, out: r.out, afterWrites: writes }
-        return r.refused ? `refused by the user's permission settings: ${r.out}` : `${r.ok ? '' : '[failed]\n'}${clip(r.out)}`
+        return r.refused ? `refused: ${r.out}. Don't retry this command or a variant of it.` : `${r.ok ? '' : '[failed]\n'}${clip(r.out)}`
       }
       default:
         return `Unknown tool: ${name}`
@@ -1027,9 +1124,12 @@ async function agent(io: IO, cfg: Config, a: Args) {
   let checkLine = ''
   if (check) {
     const r = lastRun && lastRun.command === check && lastRun.afterWrites === writes ? { ...lastRun, refused: false } : await runCommand(check)
-    const verdict = r.refused ? 'refused' : r.ok ? 'passed' : 'failed'
-    const lines = r.out.trimEnd().split('\n')
-    checkLine = `check: ${check} → ${verdict}\n${lines.slice(-15).map(l => `  ${l}`).join('\n')}`
+    if (r.refused) {
+      checkLine = `check: ${check} → not run (${r.out}). Run it yourself to verify.`
+    } else {
+      const lines = r.out.trimEnd().split('\n')
+      checkLine = `check: ${check} → ${r.ok ? 'passed' : 'failed'}\n${lines.slice(-15).map(l => `  ${l}`).join('\n')}`
+    }
   }
 
   const changedLines: string[] = []
@@ -1138,9 +1238,9 @@ Cost: $0.75 per 1,000 successful searches and per 1,000 page reads, plus tokens.
     description: `Hands one contained coding task to DeepSeek working as a small agent: it looks around the repository, edits files and runs checks on its own, then returns a short report.
 
 Inside, DeepSeek has glob, grep, read_file, write_file, edit_file and run. Reads and writes follow Claude Code's permissions like files/output_path.
-Its commands, grep and glob run through Claude Code's own Bash, Grep and Glob tools, so the user's permission rules and approval dialog apply.
+Its grep and glob run through Claude Code's own Grep and Glob tools. A command runs at once if the user's permission rules allow it, or if the user approved it for this project before; otherwise the user is asked in a dialog (allow for this run, always allow here, or deny). Deny rules always win.
 task: the goal, scope and what done means. files: files to put in front from the start (saves exploring).
-check_command: a command that verifies the work, such as a test command. DeepSeek runs it before finishing, and the plugin runs it again at the end unless nothing changed since DeepSeek's last run of it. Always give one.
+check_command: a command that verifies the work, such as a test command. DeepSeek runs it before finishing, and the plugin runs it again at the end unless nothing changed since DeepSeek's last run of it. Always give one. If the result says it was not run, run it yourself.
 max_turns: turn limit (1-${AGENT_MAX_TURNS}, default ${AGENT_DEFAULT_TURNS}). A run also stops at ${AGENT_MAX_INPUT_TOKENS} input tokens.
 Returns: stop reason, DeepSeek's summary, changed files with line counts, the check verdict with its last lines, the steps taken, usage. Not the diff: look at it with git diff if needed.
 Costs more than deepseek_chat, since every turn re-sends the history.
@@ -1185,9 +1285,22 @@ function makeIO($: EngineInterface, langOption: unknown): IO {
       $.tool.check({ tool, input: tool === 'Write' ? { file_path: filePath, content: '' } : { file_path: filePath } }),
     spawn: (argv, input) => $.process.spawn({ argv, input }),
     callTool: async (tool, input) => {
-      const r = await $.tool.call({ tool, ...input } as Parameters<typeof $.tool.call>[0])
+      const r = await $.tool.call({ tool, ...input } as unknown as Parameters<typeof $.tool.call>[0])
       return r.deny !== undefined ? { deny: r.deny } : { text: String(r.text ?? ''), isError: r.isError === true }
     },
+    checkCommand: command => $.tool.check({ tool: 'Bash', input: { command } } as Parameters<typeof $.tool.check>[0]),
+    run: async (argv, timeoutMs) => {
+      const r = await $.process.run(argv, { timeoutMs })
+      return { exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr }
+    },
+    ask: async (question, options, header) => {
+      try {
+        return await $.ui.ask(question, { options, header })
+      } catch {
+        return undefined
+      }
+    },
+    lang: () => langOf($, langOption),
     env: async name => {
       switch (name) {
         case 'HOME':
@@ -1239,6 +1352,9 @@ export const register: Register = (on, options) => {
     } catch {
       // Another plugin (such as the old deepseek-usage mod) already registered the name; skip just the command
     }
+    try {
+      await $.command.register({ name: 'deepseek-commands', description: UI[lang].commandsDescription })
+    } catch {}
     // With ~/.config/deepseek/disabled present, don't register the tools at all
     const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE')) || ''
     if (!(await $.fs.exists(disabledFile(home)))) {
@@ -1262,6 +1378,21 @@ export const register: Register = (on, options) => {
     const u = await read($, totals)
     if (u.calls === 0) return { text: await keyCheckText(makeIO($, langOption), lang, optionKey) }
     return { text: detailText(lang, u, await read($, balance)) }
+  })
+
+  on('command.run', { command: 'deepseek-commands' }, async ($, e) => {
+    const t = UI[await langOf($, langOption)]
+    const io = makeIO($, langOption)
+    const home = await homeDir(io)
+    const project = await realDir(io, await io.cwd())
+    const projects = await loadAllowed(io, home)
+    if (String((e as { args?: unknown }).args ?? '').trim() === 'clear') {
+      delete projects[project]
+      await saveAllowed(io, home, projects)
+      return { text: t.commandsCleared(project) }
+    }
+    const list = projects[project] ?? []
+    return { text: list.length ? t.commandsList(project, list, allowedFile(home)) : t.commandsNone(project) }
   })
 
   on('tool.call', { tool: /^mcp__deepseek-worker__deepseek_(chat|batch|research|agent|models)$/ }, async ($, e) => {
