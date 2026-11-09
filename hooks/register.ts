@@ -28,6 +28,8 @@ type IO = {
   env: (name: EnvName) => Promise<string | undefined>
   // Starts a command and yields its output in pieces (input goes to stdin)
   spawn: (argv: string[], input: string) => AsyncIterable<{ stream: 'stdout' | 'stderr'; text: string }>
+  // Runs one of Claude Code's own tools (Bash, Grep, Glob) through its permission check and dialog
+  callTool: (tool: 'Bash' | 'Grep' | 'Glob', input: Record<string, unknown>) => Promise<{ deny?: string; text?: string; isError?: boolean }>
   record: (used: Used[], bal: Bal | undefined) => Promise<void>
 }
 
@@ -48,16 +50,22 @@ const FILE_ONLY_INSTRUCTION =
 const FENCE_RE = /^\s*```[^\n]*\n([\s\S]*?)\n```\s*$/
 
 // Usage guide for Claude (one section of its system prompt)
-const GUIDE = `# DeepSeek worker (deepseek_chat · deepseek_batch · deepseek_research)
+const GUIDE = `# DeepSeek worker (deepseek_chat · deepseek_batch · deepseek_agent · deepseek_research)
 If the user says to use DeepSeek, or to do it yourself, follow that over the criteria below.
 Follow it even when the task doesn't fit the criteria; if you have a concern, mention it in one line.
 
-Otherwise, delegate or write it yourself, whichever costs less: "instructing + reviewing" vs "writing it yourself".
+Otherwise, pick whichever costs less overall, "instructing + reviewing" vs "writing it yourself":
 
-Delegate to DeepSeek when:
+deepseek_chat (one request, no tools, cheapest) when:
 - The output is long and well specified (many tests, boilerplate, data conversion, code in a fixed format).
+- Everything it needs fits in the prompt and files.
 - It can be verified by tests or by running it.
 - Several independent jobs can run in parallel with deepseek_batch.
+
+deepseek_agent (DeepSeek explores, edits and runs checks on its own; costs more) when:
+- The task is contained, about one module, but needs looking at several files or fixing until a check passes.
+- A command can verify it. Always give check_command; don't use the agent for work that can't be checked.
+- Examples: "make these failing tests pass", "move callers of this function to the new signature".
 
 Write it yourself when:
 - It is a small change of a few lines.
@@ -67,6 +75,9 @@ Write it yourself when:
 
 When delegating, pass reference files with files, save code results with output_path, and review by running tests or reading parts.
 After two failed re-instructions, write it yourself.
+Reviewing deepseek_agent: trust the plugin's check verdict, look at git diff --stat and only the parts that matter; don't re-read every changed file.
+If an agent run fails, don't rerun the same task: narrow it for deepseek_chat, or do it yourself.
+Never run two agents, or an agent and your own edits, on the same files at the same time.
 
 DeepSeek's cache only hits when the start of the prompt matches an earlier request exactly.
 - Put files shared across calls first in files, in the same order every time.
@@ -795,6 +806,250 @@ async function research(io: IO, cfg: Config, a: Args) {
   return finish(io, cfg, `${answer}\n\n${trace}\n${usage}`, used)
 }
 
+// ───────── Agent: DeepSeek works on its own with a small tool set ─────────
+// One tool to Claude; inside, a loop where DeepSeek looks around, edits and runs checks.
+// Reads and writes go through the same permission and link checks as files/output_path.
+// Commands, grep and glob go through Claude Code's own Bash, Grep and Glob tools, so the user's
+// permission rules and approval dialog apply as they would to Claude.
+
+const AGENT_DEFAULT_TURNS = 12
+const AGENT_MAX_TURNS = 30
+// Total input tokens one run may send before it is stopped (the whole history is re-sent every turn)
+const AGENT_MAX_INPUT_TOKENS = 400_000
+const READ_DEFAULT_LINES = 400
+const READ_MAX_LINES = 2000
+const LINE_CHARS = 500
+const TOOL_OUT_CHARS = 8_000
+const TRAIL_MAX = 40
+
+const AGENT_SYSTEM = `You work on your own in a code repository, using tools, to finish one task given by a higher-level agent (Claude). Claude reviews your work afterwards.
+- Look before you change: find the relevant files with glob and grep, and read what you need with read_file. Read a range rather than a whole large file.
+- Change only what the task needs. Use edit_file for changes to existing files and write_file for new files or full rewrites.
+- Paths are relative to the working folder.
+- Use run for tests and other checks. Don't run commands that change things beyond the task: no installing, deleting, git commits or network access.
+- If a verification command is given, run it before you finish and fix what fails. Never weaken, skip or delete tests to make them pass.
+- When you are done, or stuck, call finish once with a short summary (at most 15 lines): what you changed, how you verified it, and anything left undone. No code in the summary.`
+
+const fn = (name: string, description: string, properties: Record<string, unknown>, required: string[]) => ({
+  type: 'function',
+  function: { name, description, parameters: { type: 'object', properties, required } },
+})
+
+const AGENT_TOOLS = [
+  fn('glob', 'Finds files by glob pattern, such as src/**/*.ts.', { pattern: { type: 'string' }, path: { type: 'string', description: 'Folder to search, default the working folder' } }, ['pattern']),
+  fn(
+    'grep',
+    'Searches file contents with a regular expression; returns matching lines with line numbers.',
+    { pattern: { type: 'string' }, path: { type: 'string' }, glob: { type: 'string', description: 'Only files matching this glob, such as *.ts' } },
+    ['pattern'],
+  ),
+  fn(
+    'read_file',
+    `Reads a file with line numbers. offset is the first line (1-based); limit is the number of lines (default ${READ_DEFAULT_LINES}, at most ${READ_MAX_LINES}).`,
+    { path: { type: 'string' }, offset: { type: 'integer' }, limit: { type: 'integer' } },
+    ['path'],
+  ),
+  fn('write_file', 'Creates or overwrites a file with the given content.', { path: { type: 'string' }, content: { type: 'string' } }, ['path', 'content']),
+  fn(
+    'edit_file',
+    'Replaces old_string with new_string in a file. old_string must match exactly once, unless replace_all is true.',
+    { path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' }, replace_all: { type: 'boolean' } },
+    ['path', 'old_string', 'new_string'],
+  ),
+  fn('run', 'Runs a shell command in the working folder and returns its output (the end of it, if long).', { command: { type: 'string' } }, ['command']),
+  fn('finish', 'Ends the task with a short summary for Claude.', { summary: { type: 'string' } }, ['summary']),
+]
+
+const clip = (text: string, max = TOOL_OUT_CHARS) => (text.length > max ? `...[${text.length - max} chars omitted]\n${text.slice(-max)}` : text)
+const lineCount = (text: string) => (text === '' ? 0 : text.split('\n').length - (text.endsWith('\n') ? 1 : 0))
+
+async function agent(io: IO, cfg: Config, a: Args) {
+  const task = String(a.task ?? '')
+  const model = (a.model as string) || cfg.model
+  const effort = checkEffort(a.reasoning_effort)
+  const maxTurns = Math.max(1, Math.min(AGENT_MAX_TURNS, Math.floor(Number(a.max_turns) || AGENT_DEFAULT_TURNS)))
+  const check = typeof a.check_command === 'string' && a.check_command.trim() ? a.check_command.trim() : undefined
+  const cwd = await io.cwd()
+  const abs = (p: string) => {
+    const e = expand(cfg, p || '.')
+    return isAbsolute(e) ? e : `${cwd}/${e}`
+  }
+  const rel = (p: string) => (p.startsWith(`${cwd}/`) ? p.slice(cwd.length + 1) : p)
+
+  let user = `Task:\n${task}`
+  if (check) user += `\n\nVerification command (run it before you finish): ${check}`
+  user = await buildPrompt(io, cfg, user, a.files)
+  const messages: any[] = [
+    { role: 'system', content: `${COMMON_SYSTEM}\n\n${AGENT_SYSTEM}` },
+    { role: 'user', content: user },
+  ]
+
+  const total: Tokens = { in: 0, out: 0 }
+  const trail: string[] = []
+  // Files changed: absolute path → line count before the first change (undefined for a new file)
+  const changed = new Map<string, number | undefined>()
+  let writes = 0
+  let lastRun: { command: string; ok: boolean; out: string; afterWrites: number } | undefined
+  let respModel = model
+  let summary: string | undefined
+  let stop: 'done' | 'turn limit' | 'token limit' = 'turn limit'
+  let turns = 0
+
+  const step = async (withTools: boolean) => {
+    const body: Record<string, unknown> = { model, messages, reasoning_effort: effort }
+    if (withTools) body.tools = AGENT_TOOLS
+    const resp = await curlJson(io, cfg, '/chat/completions', body)
+    respModel = resp.model ?? respModel
+    const t = tokensOf(resp.usage)
+    if (t) {
+      total.in += t.in
+      total.out += t.out
+      for (const k of ['hit', 'miss', 'reasoning'] as const) {
+        if (t[k] !== undefined) total[k] = (total[k] ?? 0) + (t[k] as number)
+      }
+    }
+    return resp.choices?.[0]?.message ?? {}
+  }
+
+  const runCommand = async (command: string) => {
+    const r = await io.callTool('Bash', { command, description: `deepseek_agent: ${command.slice(0, 60)}` })
+    if (r.deny !== undefined) return { ok: false, refused: true, out: r.deny }
+    return { ok: !r.isError, refused: false, out: r.text ?? '' }
+  }
+
+  // Runs one tool call from DeepSeek and returns what DeepSeek reads back
+  const exec = async (name: string, x: any): Promise<string> => {
+    switch (name) {
+      case 'glob': {
+        trail.push(`glob ${x.pattern}`)
+        const r = await io.callTool('Glob', { pattern: String(x.pattern ?? ''), path: abs(String(x.path ?? '')) })
+        return r.deny !== undefined ? `refused: ${r.deny}` : clip(r.text ?? '')
+      }
+      case 'grep': {
+        trail.push(`grep ${x.pattern}`)
+        const input: Record<string, unknown> = { pattern: String(x.pattern ?? ''), path: abs(String(x.path ?? '')), output_mode: 'content', '-n': true, head_limit: 100 }
+        if (x.glob) input.glob = String(x.glob)
+        const r = await io.callTool('Grep', input)
+        return r.deny !== undefined ? `refused: ${r.deny}` : clip(r.text ?? '')
+      }
+      case 'read_file': {
+        const path = await checkedPath(io, cfg, String(x.path ?? ''), 'read')
+        trail.push(`read ${rel(path)}`)
+        if (!(await io.exists(path))) return `No such file: ${x.path}`
+        const lines = (await io.read(path)).split('\n')
+        const from = Math.max(1, Math.floor(Number(x.offset) || 1))
+        const count = Math.max(1, Math.min(READ_MAX_LINES, Math.floor(Number(x.limit) || READ_DEFAULT_LINES)))
+        const part = lines.slice(from - 1, from - 1 + count)
+        const body = part.map((l, i) => `${from + i}\t${l.length > LINE_CHARS ? `${l.slice(0, LINE_CHARS)}…` : l}`).join('\n')
+        return `(lines ${from}-${from + part.length - 1} of ${lines.length})\n${body}`
+      }
+      case 'write_file':
+      case 'edit_file': {
+        const path = await checkedPath(io, cfg, String(x.path ?? ''), 'write')
+        const exists = await io.exists(path)
+        const before = exists ? await io.read(path) : undefined
+        let after: string
+        if (name === 'write_file') {
+          after = String(x.content ?? '')
+        } else {
+          if (before === undefined) return `No such file: ${x.path}. Use write_file to create it.`
+          const oldS = String(x.old_string ?? '')
+          const n = oldS ? before.split(oldS).length - 1 : 0
+          if (n === 0) return `old_string not found in ${x.path}. Read the file again and copy the text exactly.`
+          if (n > 1 && x.replace_all !== true) return `old_string appears ${n} times in ${x.path}. Add surrounding lines to make it unique, or set replace_all.`
+          after = before.split(oldS).join(String(x.new_string ?? ''))
+        }
+        if (!changed.has(path)) changed.set(path, before === undefined ? undefined : lineCount(before))
+        await io.write(path, after)
+        writes++
+        trail.push(`${name === 'write_file' ? 'write' : 'edit'} ${rel(path)}`)
+        return `${name === 'write_file' ? 'wrote' : 'edited'} ${rel(path)} (${lineCount(after)} lines)`
+      }
+      case 'run': {
+        const command = String(x.command ?? '')
+        const r = await runCommand(command)
+        trail.push(`run ${command}${r.refused ? ' (refused)' : r.ok ? '' : ' (failed)'}`)
+        if (!r.refused) lastRun = { command, ok: r.ok, out: r.out, afterWrites: writes }
+        return r.refused ? `refused by the user's permission settings: ${r.out}` : `${r.ok ? '' : '[failed]\n'}${clip(r.out)}`
+      }
+      default:
+        return `Unknown tool: ${name}`
+    }
+  }
+
+  while (turns < maxTurns) {
+    if (total.in >= AGENT_MAX_INPUT_TOKENS) {
+      stop = 'token limit'
+      break
+    }
+    turns++
+    const msg = await step(true)
+    const calls: any[] = msg.tool_calls ?? []
+    if (calls.length === 0) {
+      // Answered without calling finish: take the text as the summary
+      summary = msg.content ?? ''
+      stop = 'done'
+      break
+    }
+    const turn: Record<string, unknown> = { role: 'assistant', content: msg.content ?? '', tool_calls: calls }
+    if (msg.reasoning_content) turn.reasoning_content = msg.reasoning_content
+    messages.push(turn)
+    // Run in order: later calls may depend on earlier edits
+    for (const c of calls) {
+      let x: any = {}
+      try {
+        x = JSON.parse(c.function?.arguments || '{}')
+      } catch {}
+      const name = c.function?.name
+      let out: string
+      if (name === 'finish') {
+        summary = String(x.summary ?? '')
+        stop = 'done'
+        out = 'ok'
+      } else {
+        try {
+          out = await exec(name, x)
+        } catch (err) {
+          out = `[error] ${(err as Error).message}`
+        }
+      }
+      messages.push({ role: 'tool', tool_call_id: c.id, content: out })
+    }
+    if (stop === 'done') break
+  }
+  if (summary === undefined) {
+    // Out of turns or tokens: ask for the summary without tools
+    messages.push({ role: 'user', content: 'Stop working now. Reply with the summary: what you changed, how you verified it, and what is left undone.' })
+    summary = (await step(false)).content ?? ''
+  }
+
+  // The verification command, run by the plugin so Claude gets a verdict that doesn't rely on DeepSeek's word
+  let checkLine = ''
+  if (check) {
+    const r = lastRun && lastRun.command === check && lastRun.afterWrites === writes ? { ...lastRun, refused: false } : await runCommand(check)
+    const verdict = r.refused ? 'refused' : r.ok ? 'passed' : 'failed'
+    const lines = r.out.trimEnd().split('\n')
+    checkLine = `check: ${check} → ${verdict}\n${lines.slice(-15).map(l => `  ${l}`).join('\n')}`
+  }
+
+  const changedLines: string[] = []
+  for (const [path, before] of changed) {
+    const now = (await io.exists(path)) ? lineCount(await io.read(path)) : 0
+    changedLines.push(`- ${rel(path)} (${before === undefined ? `new, ${now} lines` : `${before} → ${now} lines`})`)
+  }
+  const shownTrail = trail.length > TRAIL_MAX ? [...trail.slice(0, TRAIL_MAX), `... ${trail.length - TRAIL_MAX} more`] : trail
+  const text = [
+    `[agent: ${stop}, turns=${turns}]`,
+    `summary:\n${(summary ?? "").trim()}`,
+    `changed:\n${changedLines.join('\n') || '- (none)'}`,
+    ...(checkLine ? [checkLine] : []),
+    `steps: ${shownTrail.join('; ') || '(none)'}`,
+    usageLine(respModel, total),
+  ].join('\n')
+  // However many turns it took, usage counts it as one call
+  return finish(io, cfg, text, [{ model: respModel, t: total }])
+}
+
 // ───────── Tool registration ─────────
 
 const COMMON_PROPS = {
@@ -879,6 +1134,33 @@ Cost: $0.75 per 1,000 successful searches and per 1,000 page reads, plus tokens.
     run: research,
   },
   {
+    name: 'deepseek_agent',
+    description: `Hands one contained coding task to DeepSeek working as a small agent: it looks around the repository, edits files and runs checks on its own, then returns a short report.
+
+Inside, DeepSeek has glob, grep, read_file, write_file, edit_file and run. Reads and writes follow Claude Code's permissions like files/output_path.
+Its commands, grep and glob run through Claude Code's own Bash, Grep and Glob tools, so the user's permission rules and approval dialog apply.
+task: the goal, scope and what done means. files: files to put in front from the start (saves exploring).
+check_command: a command that verifies the work, such as a test command. DeepSeek runs it before finishing, and the plugin runs it again at the end unless nothing changed since DeepSeek's last run of it. Always give one.
+max_turns: turn limit (1-${AGENT_MAX_TURNS}, default ${AGENT_DEFAULT_TURNS}). A run also stops at ${AGENT_MAX_INPUT_TOKENS} input tokens.
+Returns: stop reason, DeepSeek's summary, changed files with line counts, the check verdict with its last lines, the steps taken, usage. Not the diff: look at it with git diff if needed.
+Costs more than deepseek_chat, since every turn re-sends the history.
+${EFFORT_NOTE}
+${MODEL_NOTE}`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task: { type: 'string' },
+        files: { type: 'array', items: { type: 'string' } },
+        check_command: { type: 'string' },
+        max_turns: { type: 'integer', default: AGENT_DEFAULT_TURNS, minimum: 1, maximum: AGENT_MAX_TURNS },
+        model: { type: 'string', description: MODEL_NOTE },
+        reasoning_effort: { type: 'string', enum: [...REASONING_EFFORTS], description: EFFORT_NOTE },
+      },
+      required: ['task'],
+    },
+    run: agent,
+  },
+  {
     name: 'deepseek_models',
     description: 'Lists the available DeepSeek models.',
     inputSchema: { type: 'object', properties: {} },
@@ -902,6 +1184,10 @@ function makeIO($: EngineInterface, langOption: unknown): IO {
     check: (tool, filePath) =>
       $.tool.check({ tool, input: tool === 'Write' ? { file_path: filePath, content: '' } : { file_path: filePath } }),
     spawn: (argv, input) => $.process.spawn({ argv, input }),
+    callTool: async (tool, input) => {
+      const r = await $.tool.call({ tool, ...input } as Parameters<typeof $.tool.call>[0])
+      return r.deny !== undefined ? { deny: r.deny } : { text: String(r.text ?? ''), isError: r.isError === true }
+    },
     env: async name => {
       switch (name) {
         case 'HOME':
@@ -978,7 +1264,7 @@ export const register: Register = (on, options) => {
     return { text: detailText(lang, u, await read($, balance)) }
   })
 
-  on('tool.call', { tool: /^mcp__deepseek-worker__deepseek_(chat|batch|research|models)$/ }, async ($, e) => {
+  on('tool.call', { tool: /^mcp__deepseek-worker__deepseek_(chat|batch|research|agent|models)$/ }, async ($, e) => {
     const t = TOOLS.find(x => TOOL(x.name) === e.tool)
     if (!t) return { deny: `Unknown tool: ${e.tool}` }
     const io = makeIO($, langOption)

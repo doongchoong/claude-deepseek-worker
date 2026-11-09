@@ -4,12 +4,12 @@
 
 Claude에게 저렴한 워커 **DeepSeek**을 붙여 주는 Claude Code 플러그인이에요.
 
-판단은 Claude가 해요. 설계, 원인 분석, 검수 같은 일이요. 길지만 명세가 분명한 작업(테스트 대량 작성, 보일러플레이트, 데이터 변환, 정해진 형식의 코드)과 웹 조사는 DeepSeek에 맡겨요. 결과는 파일로 바로 저장되거나 출처가 달린 짧은 요약으로만 돌아와서, Claude의 컨텍스트를 거의 쓰지 않아요.
+판단은 Claude가 해요. 설계, 원인 분석, 검수 같은 일이요. 길지만 명세가 분명한 작업(테스트 대량 작성, 보일러플레이트, 데이터 변환, 정해진 형식의 코드), 명령으로 확인할 수 있는 작은 단위의 작업, 웹 조사는 DeepSeek에 맡겨요. 결과는 파일로 바로 저장되거나 출처가 달린 짧은 요약으로만 돌아와서, Claude의 컨텍스트를 거의 쓰지 않아요.
 
 **따로 설치할 게 없어요.** Claude Code 안에서 바로 실행돼요. Python도, Node도, 별도 서버도 필요 없어서 macOS, Windows, Linux에서 똑같이 동작해요.
 
 ```
-나 ──▶ Claude (계획·검수) ──▶ deepseek_chat / batch / research ──▶ DeepSeek API
+나 ──▶ Claude (계획·검수) ──▶ deepseek_chat / batch / agent / research ──▶ DeepSeek API
               ▲                                  │
               └──── 저장된 파일 / 짧은 요약 ◀──────┘
 ```
@@ -20,6 +20,7 @@ Claude에게 저렴한 워커 **DeepSeek**을 붙여 주는 Claude Code 플러�
 | --- | --- |
 | `deepseek_chat` | 작업 하나를 맡겨요. `files`는 플러그인이 직접 읽어서 프롬프트 앞에 붙이기 때문에, Claude가 파일 내용을 옮겨 적을 필요가 없어요. `output_path`를 주면 결과를 파일로 바로 저장하고 경로와 줄 수만 돌려줘요. |
 | `deepseek_batch` | 서로 독립된 프롬프트 여러 개를 병렬로 처리하고 결과를 순서대로 돌려줘요. |
+| `deepseek_agent` | 작은 에이전트예요. DeepSeek이 직접 저장소를 둘러보고, 파일을 고치고, 확인 명령을 돌린 뒤 짧은 보고(요약, 바뀐 파일, 확인 결과)만 돌려줘요. 명령 실행, grep, glob은 Claude Code의 Bash·Grep·Glob 도구를 거치기 때문에, 내 권한 규칙과 승인 창이 그대로 적용돼요. `deepseek_chat`보다 비싸요. |
 | `deepseek_research` | DeepSeek이 직접 여러 번 웹을 검색하고 페이지를 읽은 뒤, 출처가 달린 정리만 돌려줘요. |
 | `deepseek_models` | 쓸 수 있는 모델 목록을 보여줘요. |
 | 상태 줄 | `deepseek-worker 7회 128.5Ktok hit 62% $4.38`처럼 이 세션의 호출 수, 토큰, 캐시 적중률, 계정 잔액을 보여줘요(영어 설정이면 `7 calls`). |
@@ -74,6 +75,7 @@ Claude에게 평소처럼 말하면 돼요. 직접 쓰는 것보다 맡기는 �
 - "DeepSeek한테 `parser.py` 단위 테스트를 `tests/test_parser.py`로 쓰게 하고 돌려 봐."
 - "DeepSeek 리서치로 최신 Python 릴리스에서 뭐가 바뀌었는지 찾아 줘."
 - "이 변환 작업 12개는 DeepSeek 배치로 돌려."
+- "DeepSeek 에이전트로 `tests/parser`의 실패하는 테스트를 통과시켜. 확인은 `pytest tests/parser`로."
 - "effort low로 맡겨." 명세가 아주 자세할 때는 추론을 줄여서 더 빠르고 싸게 처리해요.
 
 돌아온 결과는 Claude가 검수해요(테스트를 돌리거나 파일 일부를 읽어요). 다시 지시해도 두 번 넘게 실패하면 Claude가 직접 작성해요.

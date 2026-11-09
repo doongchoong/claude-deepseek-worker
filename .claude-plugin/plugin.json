@@ -1,7 +1,7 @@
 {
   "name": "deepseek-worker",
-  "version": "0.2.0",
-  "description": "Let Claude hand off well-specified coding and web research to DeepSeek as a cheap worker, with token and balance usage in the status line.",
+  "version": "0.3.0",
+  "description": "Let Claude hand off well-specified coding, small contained agent tasks and web research to DeepSeek as a cheap worker, with token and balance usage in the status line.",
   "author": {
     "name": "doongchoong"
   },

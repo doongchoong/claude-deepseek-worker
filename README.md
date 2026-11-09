@@ -4,12 +4,12 @@
 
 A Claude Code plugin that gives Claude a cheap worker: **DeepSeek**.
 
-Claude stays in charge of judgment — design, root-cause analysis, review. Work that is long but well specified (bulk tests, boilerplate, data conversion, code in a fixed format) and web research get handed to DeepSeek. Results are written straight to files or come back as short sourced summaries, so they barely touch Claude's context.
+Claude stays in charge of judgment — design, root-cause analysis, review. Work that is long but well specified (bulk tests, boilerplate, data conversion, code in a fixed format) small contained tasks it can check with a command, and web research get handed to DeepSeek. Results are written straight to files or come back as short sourced summaries, so they barely touch Claude's context.
 
 **Nothing else to install.** The plugin runs inside Claude Code itself — no Python, no Node, no separate server — so it works the same on macOS, Windows and Linux.
 
 ```
-You ──▶ Claude (plans, reviews) ──▶ deepseek_chat / batch / research ──▶ DeepSeek API
+You ──▶ Claude (plans, reviews) ──▶ deepseek_chat / batch / agent / research ──▶ DeepSeek API
                     ▲                                   │
                     └──── file on disk / short summary ◀┘
 ```
@@ -20,6 +20,7 @@ You ──▶ Claude (plans, reviews) ──▶ deepseek_chat / batch / research
 | --- | --- |
 | `deepseek_chat` | One task. `files` are read by the plugin and prepended, so Claude doesn't copy file contents into the call. `output_path` writes the answer straight to a file and returns only path and line count. |
 | `deepseek_batch` | Many independent prompts in parallel, results in order. |
+| `deepseek_agent` | A small agent: DeepSeek looks around the repo, edits files and runs a check command on its own, then returns a short report (summary, changed files, check verdict). Its commands, grep and glob go through Claude Code's own Bash, Grep and Glob tools, so your permission rules and approval dialog apply. Costs more than `deepseek_chat`. |
 | `deepseek_research` | DeepSeek searches and reads the web on its own, several rounds, and returns only a sourced summary. |
 | `deepseek_models` | Lists available models. |
 | Status line | `deepseek-worker 7 calls 128.5Ktok hit 62% $4.38` — calls, tokens, cache hit rate and account balance for the session. |
@@ -74,6 +75,7 @@ Just talk to Claude. It decides on its own when delegating is cheaper than writi
 - "Have DeepSeek write unit tests for `parser.py` into `tests/test_parser.py`, then run them."
 - "Use DeepSeek research: what changed in the latest Python release?"
 - "Give DeepSeek these 12 conversion jobs as a batch."
+- "Have the DeepSeek agent make the failing tests in `tests/parser` pass; check with `pytest tests/parser`."
 - "Ask DeepSeek with effort low" — less reasoning, faster and cheaper for very detailed specs.
 
 Claude reviews what comes back (runs the tests, reads parts of the file). After two failed re-instructions it writes the code itself.

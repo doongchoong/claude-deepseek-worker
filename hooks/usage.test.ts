@@ -14,7 +14,15 @@ type WorldOptions = {
   env?: Record<string, string>
   // What `defaults read -g AppleLanguages` prints; when set, /usr/bin/defaults exists
   appleLanguages?: string
+  // File contents by absolute path (anything else on disk reads as FILE BODY)
+  files?: Record<string, string>
+  // deepseek_agent: DeepSeek's message per turn (non-streaming requests), in order
+  agentSteps?: AgentStep[]
+  // Claude Code's Bash tool: the answer per command (default: passes with "ok")
+  bash?: (command: string) => { deny?: string; text?: string; isError?: boolean }
 }
+
+type AgentStep = { calls?: [string, Record<string, unknown>][]; content?: string }
 
 // Mocks the DeepSeek API, the disk, the environment and Claude Code's permission decisions in memory
 function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
@@ -26,6 +34,10 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
   const written: Record<string, string> = {}
   const statuses: (string | undefined)[] = []
   const commands: { name: string; description: string }[] = []
+  const files: Record<string, string> = { ...opts.files }
+  const bashRuns: string[] = []
+  const toolCalls: string[] = []
+  const agentRequests: any[] = []
   const balances = opts.balances ?? ['4.38']
   let b = 0
 
@@ -60,19 +72,20 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
     return { decision: 'ask' }
   })
   on('fs.exists', (_: unknown, e: any) => ({
-    value: disk.has(e.path) || (!!opts.disabled && e.path.endsWith('/disabled')),
+    value: disk.has(e.path) || e.path in files || (!!opts.disabled && e.path.endsWith('/disabled')),
   }))
   // Links in the working folder: one to a secret key outside it, one to the deny-ruled .env
   const links: Record<string, string> = { '/work/key-link': '/home/u/.ssh/id_rsa', '/work/env-link': '/work/.env' }
   on('fs.stat', (_: unknown, e: any) =>
     links[e.path]
       ? { value: { kind: 'file', size: 0, mtimeMs: 0, isLink: true, realPath: links[e.path] } }
-      : disk.has(e.path)
+      : disk.has(e.path) || e.path in files
         ? { value: { kind: 'file', size: 0, mtimeMs: 0, isLink: false, realPath: e.path } }
         : { deny: 'ENOENT' },
   )
-  on('fs.read', () => ({ value: 'FILE BODY' }))
+  on('fs.read', (_: unknown, e: any) => ({ value: files[e.path] ?? 'FILE BODY' }))
   on('fs.write', (_: unknown, e: any) => {
+    files[e.path] = e.text
     written[e.path.split('/').pop()] = e.text // the engine hands over relative paths made absolute
     return { value: undefined }
   })
@@ -82,6 +95,19 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
     const total = balances[Math.min(b++, balances.length - 1)]
     const v = { balance_infos: [{ currency: 'USD', total_balance: total }] }
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(v) } }
+  })
+  // Claude Code's own tools that deepseek_agent borrows; everything else passes through
+  on('tool.call', (_: unknown, e: any, next: any) => {
+    if (e.tool === 'Bash') {
+      bashRuns.push(e.command)
+      const a = opts.bash?.(e.command) ?? { text: 'ok' }
+      return a.deny !== undefined ? { deny: a.deny } : { result: {}, text: a.text ?? '', isError: a.isError }
+    }
+    if (e.tool === 'Grep' || e.tool === 'Glob') {
+      toolCalls.push(`${e.tool} ${e.pattern} ${e.path}`)
+      return { result: {}, text: `${e.tool} result` }
+    }
+    return next(e)
   })
   // Generation comes through curl streaming: take the body from the curl config on stdin and answer in SSE chunks
   on('process.spawn', async function* (_: unknown, e: any) {
@@ -94,6 +120,16 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
     auths.push(e.input.split('\n').find((l: string) => l.includes('Authorization')) ?? '')
     const line = e.input.split('\n').find((l: string) => l.startsWith('data-binary = '))
     const body = JSON.parse(JSON.parse(line.slice('data-binary = '.length)))
+    if (!body.stream) {
+      // deepseek_agent's turns: one JSON reply each, scripted by agentSteps
+      agentRequests.push(body)
+      const s = opts.agentSteps?.[agentRequests.length - 1] ?? { content: 'all done' }
+      const tool_calls = s.calls?.map(([name, args], i) => ({ id: `c${agentRequests.length}-${i}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }))
+      const message = { role: 'assistant', content: s.content ?? '', ...(tool_calls ? { tool_calls } : {}) }
+      yield { stream: 'stdout', text: JSON.stringify({ model: 'deepseek-flash', choices: [{ message }], usage: { prompt_tokens: 100, completion_tokens: 20 } }) }
+      running--
+      return { value: { code: 0, signal: null } }
+    }
     sent.push(body)
     const r = replies[(sent.length - 1) % replies.length]!
     const usage = r.usage ?? { prompt_tokens: 100, completion_tokens: 20, prompt_cache_hit_tokens: 50, prompt_cache_miss_tokens: 50 }
@@ -110,7 +146,7 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
     running--
     return { value: { code: 0, signal: null } }
   })
-  return { sent, written, statuses, argv0, auths, peak, checks, commands }
+  return { sent, written, statuses, argv0, auths, peak, checks, commands, files, bashRuns, toolCalls, agentRequests }
 }
 
 const start = ($: any) => $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
@@ -345,4 +381,107 @@ test('language auto falls back to English; the en option beats a Korean LANG', {
   await $.tool.call({ tool: CHAT, prompt: 'x' })
   expect(w.statuses.at(-1)).toBe('1 call 120tok hit 50% $4.38')
   expect(w.commands[0]?.description).toContain('usage')
+})
+
+// ───────── deepseek_agent ─────────
+
+const AGENT = 'mcp__deepseek-worker__deepseek_agent'
+
+test('agent: reads, edits and runs the check; the plugin reuses that run when nothing changed after it', async ($, on) => {
+  const w = world(on, [{ content: 'x' }], {
+    files: { '/work/a.py': 'def f():\n    return 1\n' },
+    bash: () => ({ text: '3 passed' }),
+    agentSteps: [
+      { calls: [['grep', { pattern: 'def f' }], ['read_file', { path: 'a.py' }]] },
+      { calls: [['edit_file', { path: 'a.py', old_string: 'return 1', new_string: 'return 2' }]] },
+      { calls: [['run', { command: 'pytest' }]] },
+      { calls: [['finish', { summary: 'Changed f to return 2. pytest passes.' }]] },
+    ],
+  })
+  await start($)
+  const r = await $.tool.call({ tool: AGENT, task: 'make f return 2', check_command: 'pytest' } as any)
+
+  expect(w.files['/work/a.py']).toBe('def f():\n    return 2\n')
+  expect(w.bashRuns).toEqual(['pytest']) // run once by DeepSeek; no edit after it, so not again
+  expect(w.toolCalls).toEqual(['Grep def f /work/.'])
+  expect(text(r)).toContain('[agent: done, turns=4]')
+  expect(text(r)).toContain('Changed f to return 2.')
+  expect(text(r)).toContain('- a.py (2 → 2 lines)')
+  expect(text(r)).toContain('check: pytest → passed')
+  expect(text(r)).toContain('steps: grep def f; read a.py; edit a.py; run pytest')
+  expect(text(r)).toContain('[usage: deepseek-flash, in=400 out=80]')
+  expect(w.agentRequests[0].tools.map((t: any) => t.function.name)).toContain('edit_file')
+  expect(w.agentRequests[0].messages[1].content).toContain('Verification command (run it before you finish): pytest')
+  expect(w.statuses.at(-1)).toBe('1 call 480tok hit 0% $4.38') // the whole run counts as one call
+})
+
+test('agent: the plugin runs the check itself when files changed after the last run', async ($, on) => {
+  let n = 0
+  const w = world(on, [{ content: 'x' }], {
+    bash: () => (n++ === 0 ? { text: '1 failed', isError: true } : { text: '1 passed' }),
+    agentSteps: [
+      { calls: [['run', { command: 'npm test' }]] },
+      { calls: [['write_file', { path: 'src/new.ts', content: 'export const x = 1\n' }]] },
+      { calls: [['finish', { summary: 'Added src/new.ts.' }]] },
+    ],
+  })
+  await start($)
+  const r = await $.tool.call({ tool: AGENT, task: 't', check_command: 'npm test' } as any)
+
+  expect(w.bashRuns).toEqual(['npm test', 'npm test'])
+  expect(text(r)).toContain('- src/new.ts (new, 1 lines)')
+  expect(text(r)).toContain('check: npm test → passed')
+  expect(text(r)).toContain('run npm test (failed)')
+})
+
+test('agent: commands the user refuses, deny-ruled files and paths outside are reported back, not done', async ($, on) => {
+  const w = world(on, [{ content: 'x' }], {
+    bash: c => (c.startsWith('rm') ? { deny: 'The user declined' } : { text: 'ok' }),
+    agentSteps: [
+      { calls: [['run', { command: 'rm -rf build' }], ['read_file', { path: '.env' }], ['write_file', { path: '/etc/x', content: 'y' }]] },
+      { calls: [['finish', { summary: 'Could not do it.' }]] },
+    ],
+  })
+  await start($)
+  const r = await $.tool.call({ tool: AGENT, task: 't', check_command: 'rm -rf build' } as any)
+
+  const results = w.agentRequests[1].messages.filter((m: any) => m.role === 'tool').map((m: any) => m.content)
+  expect(results[0]).toContain('refused by the user')
+  expect(results[1]).toContain("permission settings block it")
+  expect(results[2]).toContain('outside the working folder')
+  expect(w.files['/etc/x']).toBeUndefined()
+  expect(text(r)).toContain('changed:\n- (none)')
+  expect(text(r)).toContain('check: rm -rf build → refused')
+})
+
+test('agent: stops at max_turns and asks for a summary without tools', async ($, on) => {
+  const w = world(on, [{ content: 'x' }], {
+    agentSteps: [{ calls: [['glob', { pattern: '**/*.ts' }]] }, { calls: [['glob', { pattern: '**/*.js' }]] }, { content: 'Looked around; nothing changed.' }],
+  })
+  await start($)
+  const r = await $.tool.call({ tool: AGENT, task: 't', max_turns: 2 } as any)
+
+  expect(w.agentRequests.length).toBe(3)
+  expect(w.agentRequests[2].tools).toBeUndefined()
+  expect(text(r)).toContain('[agent: turn limit, turns=2]')
+  expect(text(r)).toContain('Looked around; nothing changed.')
+  expect(w.bashRuns).toEqual([]) // no check_command, so nothing run
+})
+
+test('agent: edit_file needs an exact, unique match', async ($, on) => {
+  const w = world(on, [{ content: 'x' }], {
+    files: { '/work/b.txt': 'a\na\n' },
+    agentSteps: [
+      { calls: [['edit_file', { path: 'b.txt', old_string: 'zzz', new_string: 'y' }], ['edit_file', { path: 'b.txt', old_string: 'a', new_string: 'y' }]] },
+      { calls: [['edit_file', { path: 'b.txt', old_string: 'a', new_string: 'y', replace_all: true }]] },
+      { calls: [['finish', { summary: 'done' }]] },
+    ],
+  })
+  await start($)
+  await $.tool.call({ tool: AGENT, task: 't' } as any)
+
+  const first = w.agentRequests[1].messages.filter((m: any) => m.role === 'tool').map((m: any) => m.content)
+  expect(first[0]).toContain('old_string not found')
+  expect(first[1]).toContain('appears 2 times')
+  expect(w.files['/work/b.txt']).toBe('y\ny\n')
 })
