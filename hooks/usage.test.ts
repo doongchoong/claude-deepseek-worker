@@ -57,6 +57,11 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
     statuses.push(e.text)
     return { value: undefined }
   })
+  const logs: string[] = []
+  on('ui.log', (_: unknown, e: any) => {
+    logs.push(e.text)
+    return { value: undefined }
+  })
   on('env.get', (_: unknown, e: any) => ({
     // DEEPSEEK_API_KEY is set, but the plugin must never read it
     value: ({ HOME: '/home/u', DEEPSEEK_API_KEY: 'env-key', ...opts.env } as Record<string, string>)[e.name],
@@ -174,7 +179,7 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
     running--
     return { value: { code: 0, signal: null } }
   })
-  return { sent, written, statuses, argv0, auths, peak, checks, commands, files, bashRuns, toolCalls, agentRequests, questions, offers }
+  return { sent, written, statuses, argv0, auths, peak, checks, commands, files, bashRuns, toolCalls, agentRequests, questions, offers, logs }
 }
 
 const start = ($: any) => $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
@@ -709,4 +714,59 @@ test('agent: searches the web with DeepSeek; web_fetch opens only result URLs or
   expect(second[3]).toContain('page body') // written in the task
   expect(text(r)).toContain('web: searches=1 fetches=2')
   expect(w.agentRequests[0].tools.map((t: any) => t.function.name)).toEqual(expect.arrayContaining(['web_search', 'web_fetch']))
+})
+
+// ───────── Progress for people ─────────
+
+test('agent: a transcript line per turn, live status while it works, and usage back on the status line after', async ($, on) => {
+  const w = world(on, [{ content: 'x' }], {
+    files: { '/work/a.py': 'x = 1\n' },
+    bashRule: () => 'allow',
+    agentSteps: [
+      { calls: [['read_file', { path: 'a.py' }]] },
+      { calls: [['edit_file', { path: 'a.py', old_string: 'x = 1', new_string: 'x = 2' }], ['run', { command: 'pytest' }]] },
+      { calls: [['finish', { summary: 's' }]] },
+    ],
+  })
+  await start($)
+  await $.tool.call({ tool: AGENT, task: 'make x\n  equal 2', check_command: 'pytest' } as any)
+
+  expect(w.logs).toEqual([
+    'DeepSeek agent started: make x equal 2',
+    'DeepSeek agent · turn 1/12: read a.py',
+    'DeepSeek agent · turn 2/12: edit a.py; run pytest (allowed by rule)',
+    'DeepSeek agent finished (done, 3 turns) · check passed',
+  ])
+  expect(w.statuses).toContain('agent 1/12 · thinking')
+  expect(w.statuses).toContain('agent 2/12 · run pytest')
+  expect(w.statuses.at(-1)).toBe('1 call 360tok hit 0% $4.38') // usage restored at the end
+})
+
+test('agent: progress in Korean with the language option', { options: { language: 'ko' } }, async ($, on) => {
+  const w = world(on, [{ content: 'x' }], { agentSteps: [{ calls: [['glob', { pattern: '*.py' }]] }, { calls: [['finish', { summary: 's' }]] }] })
+  await start($)
+  await $.tool.call({ tool: AGENT, task: 't' } as any)
+  expect(w.logs[1]).toBe('DeepSeek 에이전트 · 1/12턴: glob *.py')
+  expect(w.logs.at(-1)).toBe('DeepSeek 에이전트 끝 (완료, 2턴)')
+  expect(w.statuses).toContain('에이전트 1/12턴 · 생각 중')
+})
+
+test('chat and batch: live status while generating, then usage again', async ($, on) => {
+  const long = Array.from({ length: 45 }, (_, i) => `line ${i}`).join('\n')
+  const w = world(on, [{ content: long }])
+  await start($)
+  await $.tool.call({ tool: CHAT, prompt: 'x', output_path: 'out.txt' })
+  expect(w.statuses.slice(1, 3)).toEqual(['writing… 23 lines', 'writing… 44 lines']) // the reply arrives in two halves here
+
+  await $.tool.call({ tool: BATCH, prompts: ['a', 'b'] })
+  expect(w.statuses).toContain('batch 2/2 done')
+  expect(w.statuses.at(-1)).toMatch(/^3 calls /)
+})
+
+test('a failing tool still puts the usage back on the status line', async ($, on) => {
+  const w = world(on, [{ content: 'x' }])
+  await start($)
+  await $.tool.call({ tool: CHAT, prompt: 'x' })
+  await $.tool.call({ tool: CHAT, prompt: 'x', reasoning_effort: 'bogus' } as any)
+  expect(w.statuses.at(-1)).toBe('1 call 120tok hit 50% $4.38')
 })

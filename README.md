@@ -23,7 +23,8 @@ You ──▶ Claude (plans, reviews) ──▶ deepseek_chat / batch / agent / 
 | `deepseek_agent` | A small agent: DeepSeek looks around the repo, searches the web (DeepSeek's own search), edits files and runs a check command on its own, then returns a short report (summary, changed files, check verdict). Commands it wants to run follow your permission rules: an allowed command runs, a denied one never does, and anything else is put to you in a dialog (allow for this run, always allow in this project, or deny). Costs more than `deepseek_chat`. |
 | `deepseek_research` | DeepSeek searches and reads the web on its own, several rounds, and returns only a sourced summary. |
 | `deepseek_models` | Lists available models. |
-| Status line | `deepseek-worker 7 calls 128.5Ktok hit 62% $4.38` — calls, tokens, cache hit rate and account balance for the session. |
+| Status line | `deepseek-worker 7 calls 128.5Ktok hit 62% $4.38` — calls, tokens, cache hit rate and account balance for the session. While a tool works it shows progress instead (`agent 3/12 · run pytest`, `writing… 120 lines`, `batch 5/12 done`). |
+| Progress lines | `deepseek_agent` leaves a line in the transcript when it starts, after each turn (`turn 2/12: edit a.py; run pytest`) and when it ends. They are for you only; Claude still gets just the final report. |
 | `/deepseek-commands` | Lists the commands you chose to always allow for the DeepSeek agent in this project; `/deepseek-commands clear` forgets them. |
 | `/deepseek-usage` | Detailed usage for the session: cached / uncached input, output, reasoning, balance spent. Before the first call it checks the key and shows the balance (free). |
 | Guidance for Claude | When to delegate and when to do it itself, and how to keep DeepSeek's prompt cache warm — added to Claude's system prompt. |

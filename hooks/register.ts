@@ -38,6 +38,9 @@ type IO = {
   ask: (question: string, options: string[], header: string) => Promise<string | undefined>
   // The language people read
   lang: () => Promise<Lang>
+  // Progress for people: a line in the transcript, and the plugin's status line (restored when the tool ends)
+  log: (text: string) => void
+  status: (text: string) => void
   record: (used: Used[], bal: Bal | undefined) => Promise<void>
 }
 
@@ -160,6 +163,16 @@ const UI = {
       `Commands the DeepSeek agent may run in ${dir} without asking:\n${list.map(c => `  ${c}`).join('\n')}\n\nForget them with /deepseek-commands clear, or edit ${file}.`,
     commandsCleared: (dir: string) => `Forgot the remembered commands for ${dir}.`,
     commandsDescription: 'Show or clear the commands the DeepSeek agent may run here without asking',
+    agentStart: (task: string) => `DeepSeek agent started: ${task}`,
+    agentTurn: (n: number, max: number, actions: string) => `DeepSeek agent · turn ${n}/${max}: ${actions}`,
+    agentEnd: (stop: string, turns: number, check?: string) => `DeepSeek agent finished (${stop}, ${turns} turns)${check ? ` · check ${check}` : ''}`,
+    agentStatus: (n: number, max: number, doing: string) => `agent ${n}/${max} · ${doing}`,
+    thinking: 'thinking',
+    checking: (c: string) => `checking: ${c}`,
+    stops: { done: 'done', 'turn limit': 'turn limit', 'token limit': 'token limit' } as Record<string, string>,
+    verdicts: { passed: 'passed', failed: 'failed', 'not run': 'not run' } as Record<string, string>,
+    writing: (lines: number) => `writing… ${lines} lines`,
+    batchDone: (done: number, total: number) => `batch ${done}/${total} done`,
   },
   ko: {
     commandDescription: '이 세션의 DeepSeek 워커 토큰 사용량과 계정 잔액을 자세히 보기',
@@ -190,6 +203,16 @@ const UI = {
       `DeepSeek 에이전트가 ${dir}에서 묻지 않고 실행하는 명령:\n${list.map(c => `  ${c}`).join('\n')}\n\n/deepseek-commands clear 로 지우거나 ${file}을 고치면 돼요.`,
     commandsCleared: (dir: string) => `${dir}에서 기억해 둔 명령을 지웠어요.`,
     commandsDescription: 'DeepSeek 에이전트가 이 폴더에서 묻지 않고 실행하는 명령 보기·지우기',
+    agentStart: (task: string) => `DeepSeek 에이전트 시작: ${task}`,
+    agentTurn: (n: number, max: number, actions: string) => `DeepSeek 에이전트 · ${n}/${max}턴: ${actions}`,
+    agentEnd: (stop: string, turns: number, check?: string) => `DeepSeek 에이전트 끝 (${stop}, ${turns}턴)${check ? ` · 확인 ${check}` : ''}`,
+    agentStatus: (n: number, max: number, doing: string) => `에이전트 ${n}/${max}턴 · ${doing}`,
+    thinking: '생각 중',
+    checking: (c: string) => `확인 중: ${c}`,
+    stops: { done: '완료', 'turn limit': '턴 한도', 'token limit': '토큰 한도' } as Record<string, string>,
+    verdicts: { passed: '통과', failed: '실패', 'not run': '실행 안 됨' } as Record<string, string>,
+    writing: (lines: number) => `작성 중… ${lines}줄`,
+    batchDone: (done: number, total: number) => `배치 ${done}/${total} 완료`,
   },
 } satisfies Record<Lang, unknown>
 
@@ -384,7 +407,10 @@ async function curlJson(io: IO, cfg: Config, path: string, body: unknown): Promi
 type Streamed = { content: string; usage: any; model?: string; finish?: string; error?: string }
 
 // Calls /chat/completions with stream: true and collects the SSE chunks. If cut off midway, returns what arrived.
-async function streamChat(io: IO, cfg: Config, body: Record<string, unknown>): Promise<Streamed> {
+// onLines, when given, hears the line count as the reply grows (every 20 lines), for a progress display
+async function streamChat(io: IO, cfg: Config, body: Record<string, unknown>, onLines?: (lines: number) => void): Promise<Streamed> {
+  let lines = 0
+  let shown = 0
   const req = { ...body, stream: true, stream_options: { include_usage: true } }
   const out: Streamed = { content: '', usage: undefined }
   const parts: string[] = []
@@ -406,7 +432,16 @@ async function streamChat(io: IO, cfg: Config, body: Record<string, unknown>): P
     if (chunk.model) out.model = chunk.model
     if (chunk.usage) out.usage = chunk.usage
     for (const c of chunk.choices ?? []) {
-      if (c.delta?.content) parts.push(c.delta.content)
+      if (c.delta?.content) {
+        parts.push(c.delta.content)
+        if (onLines) {
+          lines += c.delta.content.split('\n').length - 1
+          if (lines - shown >= 20) {
+            shown = lines
+            onLines(lines)
+          }
+        }
+      }
       if (c.finish_reason) out.finish = c.finish_reason
     }
   }
@@ -480,7 +515,7 @@ async function buildPrompt(io: IO, cfg: Config, prompt: string, files: unknown) 
 
 type Reply = { content: string; usage: Tokens | undefined; model: string; complete: boolean; notes: string[] }
 
-async function request(io: IO, cfg: Config, a: Args, opts: { prompt: string; maxTokens?: number }): Promise<Reply> {
+async function request(io: IO, cfg: Config, a: Args, opts: { prompt: string; maxTokens?: number; onLines?: (lines: number) => void }): Promise<Reply> {
   const system = a.system ? `${COMMON_SYSTEM}\n\n${a.system}` : COMMON_SYSTEM
   const model = (a.model as string) || cfg.model
   const body: Record<string, unknown> = {
@@ -495,7 +530,7 @@ async function request(io: IO, cfg: Config, a: Args, opts: { prompt: string; max
   const maxTokens = (a.max_tokens as number | undefined) ?? opts.maxTokens
   if (maxTokens != null) body.max_tokens = maxTokens
 
-  const s = await streamChat(io, cfg, body)
+  const s = await streamChat(io, cfg, body, opts.onLines)
   const notes = s.error
     ? [INTERRUPTED_NOTE.replace('{}', s.error.slice(0, 200))]
     : s.finish === 'length'
@@ -620,12 +655,14 @@ async function chat(io: IO, cfg: Config, a: Args) {
   const prompt = String(a.prompt ?? '')
   const outputPath = a.output_path as string | undefined
   if (!outputPath) {
-    const r = await request(io, cfg, a, { prompt })
+    const ui = UI[await io.lang()]
+    const r = await request(io, cfg, a, { prompt, onLines: n => io.status(ui.writing(n)) })
     const t = tail(r)
     return finish(io, cfg, t ? `${r.content}\n\n${t}` : r.content, r.usage ? [{ model: r.model, t: r.usage }] : [])
   }
   await checkedPath(io, cfg, outputPath, 'write') // check the path can be written before paying for the generation
-  const r = await request(io, cfg, a, { prompt: prompt + FILE_ONLY_INSTRUCTION, maxTokens: FILE_MAX_TOKENS })
+  const ui = UI[await io.lang()]
+  const r = await request(io, cfg, a, { prompt: prompt + FILE_ONLY_INSTRUCTION, maxTokens: FILE_MAX_TOKENS, onLines: n => io.status(ui.writing(n)) })
   // An empty or incomplete reply must not overwrite an existing file
   let saved: string
   if (!r.content.trim()) {
@@ -665,6 +702,8 @@ async function pool<T>(n: number, jobs: (() => Promise<T>)[]): Promise<T[]> {
 async function batch(io: IO, cfg: Config, a: Args) {
   const prompts = (a.prompts as string[] | undefined) ?? []
   const used: Used[] = []
+  const ui = UI[await io.lang()]
+  let done = 0
   const results = await pool(
     concurrencyOf(a.concurrency),
     prompts.map((p, i) => async () => {
@@ -675,6 +714,8 @@ async function batch(io: IO, cfg: Config, a: Args) {
         return `=== #${i} ===\n${t ? `${r.content}\n\n${t}` : r.content}`
       } catch (err) {
         return `=== #${i} ===\n[error] ${(err as Error).message}` // one failure doesn't stop the rest
+      } finally {
+        io.status(ui.batchDone(++done, prompts.length))
       }
     }),
   )
@@ -1168,14 +1209,23 @@ async function agent(io: IO, cfg: Config, a: Args) {
     }
   }
 
+  // Progress for people: one line per turn in the transcript, and what is happening now in the status line
+  const ui = UI[await io.lang()]
+  const oneLine = (t: string, max = 80) => {
+    const l = t.replace(/\s+/g, ' ').trim()
+    return l.length > max ? `${l.slice(0, max - 1)}…` : l
+  }
+  io.log(ui.agentStart(oneLine(task)))
   while (turns < maxTurns) {
     if (total.in >= AGENT_MAX_INPUT_TOKENS) {
       stop = 'token limit'
       break
     }
     turns++
+    io.status(ui.agentStatus(turns, maxTurns, ui.thinking))
     const msg = await step(true)
     const calls: any[] = msg.tool_calls ?? []
+    const trailBefore = trail.length
     if (calls.length === 0) {
       // Answered without calling finish: take the text as the summary
       summary = msg.content ?? ''
@@ -1198,6 +1248,7 @@ async function agent(io: IO, cfg: Config, a: Args) {
         stop = 'done'
         out = 'ok'
       } else {
+        io.status(ui.agentStatus(turns, maxTurns, oneLine(`${name} ${x.command ?? x.path ?? x.pattern ?? x.query ?? x.url ?? ''}`, 60)))
         try {
           out = await exec(name, x)
         } catch (err) {
@@ -1206,6 +1257,8 @@ async function agent(io: IO, cfg: Config, a: Args) {
       }
       messages.push({ role: 'tool', tool_call_id: c.id, content: out })
     }
+    const did = trail.slice(trailBefore)
+    if (did.length) io.log(ui.agentTurn(turns, maxTurns, oneLine(did.join('; '), 160)))
     if (stop === 'done') break
   }
   if (summary === undefined) {
@@ -1216,8 +1269,11 @@ async function agent(io: IO, cfg: Config, a: Args) {
 
   // The verification command, run by the plugin so Claude gets a verdict that doesn't rely on DeepSeek's word
   let checkLine = ''
+  let verdict: string | undefined
   if (check) {
+    io.status(ui.checking(oneLine(check, 60)))
     const r = lastRun && lastRun.command === check && lastRun.afterWrites === writes ? { ...lastRun, refused: false } : await runCommand(check)
+    verdict = r.refused ? 'not run' : r.ok ? 'passed' : 'failed'
     if (r.refused) {
       checkLine = `check: ${check} → not run (${r.out}). Run it yourself to verify.`
     } else {
@@ -1241,6 +1297,7 @@ async function agent(io: IO, cfg: Config, a: Args) {
     ...(searches || fetches ? [`web: searches=${searches} fetches=${fetches} (DeepSeek Search/Fetch, billed per request)`] : []),
     usageLine(respModel, total),
   ].join('\n')
+  io.log(ui.agentEnd(ui.stops[stop] ?? stop, turns, verdict && (ui.verdicts[verdict] ?? verdict)))
   // However many turns it took, usage counts it as one call
   return finish(io, cfg, text, [{ model: respModel, t: total }])
 }
@@ -1398,6 +1455,8 @@ function makeIO($: EngineInterface, langOption: unknown): IO {
       }
     },
     lang: () => langOf($, langOption),
+    log: text => $.ui.log(text),
+    status: text => $.ui.status(text),
     env: async name => {
       switch (name) {
         case 'HOME':
@@ -1502,6 +1561,9 @@ export const register: Register = (on, options) => {
       return { result: await t.run(io, cfg, { ...(e as object) } as Args) }
     } catch (err) {
       return { deny: `${t.name} failed: ${(err as Error).message}` }
+    } finally {
+      // Progress may have taken over the status line; put the usage back
+      $.ui.status(statusText(await langOf($, langOption), await read($, totals), await read($, balance)))
     }
   })
 }
