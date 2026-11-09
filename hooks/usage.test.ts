@@ -24,6 +24,8 @@ type WorldOptions = {
   bashRule?: (command: string) => 'allow' | 'deny' | 'ask'
   // The user's answer in the approval dialog (default: no answer, as when nobody can be asked)
   answer?: (question: string) => string | undefined
+  // A session without Claude Code's Grep and Glob tools
+  noSearchTools?: boolean
 }
 
 type AgentStep = { calls?: [string, Record<string, unknown>][]; content?: string }
@@ -80,7 +82,9 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
       const d = opts.bashRule?.(e.input.command) ?? 'ask'
       return d === 'deny' ? { decision: 'deny', reason: 'rule Bash(rm:*)' } : { decision: d }
     }
-    const path: string = e.input.file_path
+    // Only file reads and writes are judged here; Grep, Glob and the question dialog are allowed
+    if (e.tool !== 'Read' && e.tool !== 'Write' && e.tool !== 'Edit') return { decision: 'allow' }
+    const path: string = e.input.file_path ?? ''
     checks.push(`${e.tool} ${path}`)
     if (path.startsWith('/tmp/scratch/')) return { decision: 'allow' }
     if (path.endsWith('/.env')) return { decision: 'deny', reason: 'rule Read(.env)', rule: 'Read(.env)' }
@@ -100,6 +104,17 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
         : { deny: 'ENOENT' },
   )
   on('fs.read', (_: unknown, e: any) => ({ value: files[e.path] ?? 'FILE BODY' }))
+  on('fs.list', (_: unknown, e: any) => {
+    const dir = String(e.path).replace(/\/$/, '')
+    const all = [...disk, ...Object.keys(files)]
+    const names = new Set(all.filter(p => p.startsWith(`${dir}/`)).map(p => p.slice(dir.length + 1).split('/')[0]!))
+    const value = [...names].map(name => {
+      const path = `${dir}/${name}`
+      const isDir = all.some(p => p.startsWith(`${path}/`))
+      return { name, kind: isDir ? 'dir' : 'file', size: (files[path] ?? '').length, mtimeMs: 0, isLink: false }
+    })
+    return { value }
+  })
   on('fs.write', (_: unknown, e: any) => {
     files[e.path] = e.text
     written[e.path.split('/').pop()] = e.text // the engine hands over relative paths made absolute
@@ -129,6 +144,7 @@ function world(on: any, replies: Reply[], opts: WorldOptions = {}) {
       if (a === undefined) return { deny: 'dismissed' }
       return { result: { questions: e.questions, answers: { [q]: a } }, text: `answered ${a}` }
     }
+    if ((e.tool === 'Grep' || e.tool === 'Glob') && opts.noSearchTools) throw new Error(`No such tool: ${e.tool}`)
     if (e.tool === 'Grep' || e.tool === 'Glob') {
       toolCalls.push(`${e.tool} ${e.pattern} ${e.path}`)
       return { result: {}, text: `${e.tool} result` }
@@ -769,4 +785,46 @@ test('a failing tool still puts the usage back on the status line', async ($, on
   await $.tool.call({ tool: CHAT, prompt: 'x' })
   await $.tool.call({ tool: CHAT, prompt: 'x', reasoning_effort: 'bogus' } as any)
   expect(w.statuses.at(-1)).toBe('1 call 120tok hit 50% $4.38')
+})
+
+// ───────── glob and grep without Claude Code's tools; short paths in progress ─────────
+
+test('agent: without Claude Code\'s Glob/Grep, the plugin searches itself and skips refused files', async ($, on) => {
+  const w = world(on, [{ content: 'x' }], {
+    noSearchTools: true,
+    files: {
+      '/work/a.py': 'def a():\n    pass\n',
+      '/work/src/b.py': 'x = 1\ndef b(): pass\n',
+      '/work/node_modules/m/i.py': 'def hidden(): pass\n',
+      '/work/.env': 'def SECRET=1\n',
+      '/work/notes.txt': 'def in text\n',
+    },
+    agentSteps: [
+      { calls: [['glob', { pattern: '**/*.py' }], ['grep', { pattern: '^def ' }], ['grep', { pattern: 'def', glob: '*.txt' }]] },
+      { calls: [['finish', { summary: 's' }]] },
+    ],
+  })
+  await start($)
+  await $.tool.call({ tool: AGENT, task: 't' } as any)
+  const out = w.agentRequests[1].messages.filter((m: any) => m.role === 'tool').map((m: any) => m.content)
+  expect(out[0]).toContain('a.py\nsrc/b.py')
+  expect(out[0]).not.toContain('node_modules')
+  expect(out[1]).toContain('a.py:1:def a():')
+  expect(out[1]).toContain('src/b.py:2:def b(): pass')
+  expect(out[1]).not.toContain('SECRET') // .env has a deny rule
+  expect(out[2]).toContain('notes.txt:1:def in text')
+  expect(out[2]).not.toContain('a.py')
+})
+
+test('agent: progress lines show long paths by their last two parts', async ($, on) => {
+  const deep = '/tmp/scratch/some/very/long/folder/agent-trial/textstats.py'
+  const w = world(on, [{ content: 'x' }], {
+    files: { [deep]: 'x\n' },
+    agentSteps: [{ calls: [['read_file', { path: deep }]] }, { calls: [['finish', { summary: 's' }]] }],
+  })
+  await start($)
+  const r = await $.tool.call({ tool: AGENT, task: `Fix ${deep}` } as any)
+  expect(w.logs[0]).toBe('DeepSeek agent started: Fix …/agent-trial/textstats.py')
+  expect(w.logs[1]).toBe('DeepSeek agent · turn 1/12: read …/agent-trial/textstats.py')
+  expect(text(r)).toContain(`read ${deep}`) // the report to Claude keeps the full path
 })

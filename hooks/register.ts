@@ -38,6 +38,8 @@ type IO = {
   ask: (question: string, options: string[], header: string) => Promise<string | undefined>
   // The language people read
   lang: () => Promise<Lang>
+  // A directory's entries
+  list: (path: string) => Promise<{ name: string; kind: 'file' | 'dir' | 'other'; size: number; isLink: boolean }[]>
   // Progress for people: a line in the transcript, and the plugin's status line (restored when the tool ends)
   log: (text: string) => void
   status: (text: string) => void
@@ -899,6 +901,57 @@ async function research(io: IO, cfg: Config, a: Args) {
 // allows it or the user approved it for this project before; otherwise the user is asked in a dialog.
 // (Claude Code's own Bash tool can't be used: in auto mode its classifier refuses calls no user request explains.)
 
+// ───────── glob and grep without Claude Code's tools (some sessions don't have Grep/Glob) ─────────
+
+const SKIP_DIRS = new Set(['.git', 'node_modules', '.venv', 'venv', '__pycache__', 'dist', 'build', '.next', 'target', '.cache', '.tox'])
+const WALK_MAX_FILES = 5000
+const GREP_MAX_FILES = 800
+const GREP_MAX_BYTES = 1_000_000
+const GLOB_MAX_RESULTS = 200
+const GREP_MAX_MATCHES = 100
+
+// Files under root, breadth first, skipping dependency and build folders and not following links
+async function walk(io: IO, root: string): Promise<string[]> {
+  const files: string[] = []
+  const queue = [normalize(root).replace(/\/$/, '')]
+  while (queue.length && files.length < WALK_MAX_FILES) {
+    const dir = queue.shift()!
+    let entries
+    try {
+      entries = await io.list(dir)
+    } catch {
+      continue
+    }
+    for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      const path = `${dir}/${e.name}`
+      if (e.kind === 'dir' && !e.isLink) {
+        if (!SKIP_DIRS.has(e.name)) queue.push(path)
+      } else if (e.kind === 'file' && !e.isLink && e.size <= GREP_MAX_BYTES) {
+        files.push(path)
+      }
+    }
+  }
+  return files
+}
+
+// A glob as a regular expression over a path relative to the search folder: ** spans folders, * and ? don't
+function globRegExp(glob: string) {
+  let re = ''
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i]!
+    if (ch === '*' && glob[i + 1] === '*') {
+      i++
+      if (glob[i + 1] === '/') {
+        i++
+        re += '(?:.*/)?'
+      } else re += '.*'
+    } else if (ch === '*') re += '[^/]*'
+    else if (ch === '?') re += '[^/]'
+    else re += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+  }
+  return new RegExp(`^${re}$`)
+}
+
 const AGENT_DEFAULT_TURNS = 12
 const AGENT_MAX_TURNS = 30
 // Total input tokens one run may send before it is stopped (the whole history is re-sent every turn)
@@ -1137,15 +1190,63 @@ async function agent(io: IO, cfg: Config, a: Args) {
     switch (name) {
       case 'glob': {
         trail.push(`glob ${x.pattern}`)
-        const r = await io.callTool('Glob', { pattern: String(x.pattern ?? ''), path: abs(String(x.path ?? '')) })
-        return r.deny !== undefined ? `refused: ${r.deny}` : data(`glob ${x.pattern}`, clip(r.text ?? ''))
+        const pattern = String(x.pattern ?? '')
+        const base = abs(String(x.path ?? ''))
+        let r
+        try {
+          r = await io.callTool('Glob', { pattern, path: base })
+        } catch {
+          // This session has no Glob tool: walk the folder ourselves
+          await checkedPath(io, cfg, base, 'read')
+          const re = globRegExp(pattern)
+          const root = normalize(base).replace(/\/$/, '')
+          const hits = (await walk(io, root)).filter(f => re.test(f.slice(root.length + 1)))
+          const shown = hits.slice(0, GLOB_MAX_RESULTS).map(rel)
+          const more = hits.length > GLOB_MAX_RESULTS ? `\n... ${hits.length - GLOB_MAX_RESULTS} more` : ''
+          return data(`glob ${pattern}`, (shown.join('\n') || 'no files') + more)
+        }
+        return r.deny !== undefined ? `refused: ${r.deny}` : data(`glob ${pattern}`, clip(r.text ?? ''))
       }
       case 'grep': {
         trail.push(`grep ${x.pattern}`)
-        const input: Record<string, unknown> = { pattern: String(x.pattern ?? ''), path: abs(String(x.path ?? '')), output_mode: 'content', '-n': true, head_limit: 100 }
+        const pattern = String(x.pattern ?? '')
+        const base = abs(String(x.path ?? ''))
+        const input: Record<string, unknown> = { pattern, path: base, output_mode: 'content', '-n': true, head_limit: 100 }
         if (x.glob) input.glob = String(x.glob)
-        const r = await io.callTool('Grep', input)
-        return r.deny !== undefined ? `refused: ${r.deny}` : data(`grep ${x.pattern}`, clip(r.text ?? ''))
+        let r
+        try {
+          r = await io.callTool('Grep', input)
+        } catch {
+          // This session has no Grep tool: search ourselves, skipping files the permission checks refuse
+          let re: RegExp
+          try {
+            re = new RegExp(pattern)
+          } catch (err) {
+            return `Invalid regular expression: ${(err as Error).message}`
+          }
+          await checkedPath(io, cfg, base, 'read')
+          const root = normalize(base).replace(/\/$/, '')
+          const only = x.glob ? globRegExp(String(x.glob).includes('/') ? String(x.glob) : `**/${x.glob}`) : undefined
+          const out: string[] = []
+          let scanned = 0
+          for (const f of await walk(io, root)) {
+            if (out.length >= GREP_MAX_MATCHES || scanned >= GREP_MAX_FILES) break
+            if (only && !only.test(f.slice(root.length + 1))) continue
+            try {
+              await checkedPath(io, cfg, f, 'read')
+            } catch {
+              continue // denied, or outside what Claude may read
+            }
+            scanned++
+            const text = await io.read(f)
+            if (text.includes('\u0000')) continue
+            text.split('\n').forEach((line, i) => {
+              if (out.length < GREP_MAX_MATCHES && re.test(line)) out.push(`${rel(f)}:${i + 1}:${line.length > LINE_CHARS ? `${line.slice(0, LINE_CHARS)}…` : line}`)
+            })
+          }
+          return data(`grep ${pattern}`, out.join('\n') || 'no matches')
+        }
+        return r.deny !== undefined ? `refused: ${r.deny}` : data(`grep ${pattern}`, clip(r.text ?? ''))
       }
       case 'read_file': {
         const path = await checkedPath(io, cfg, String(x.path ?? ''), 'read')
@@ -1211,8 +1312,14 @@ async function agent(io: IO, cfg: Config, a: Args) {
 
   // Progress for people: one line per turn in the transcript, and what is happening now in the status line
   const ui = UI[await io.lang()]
+  // Long paths show as their last two parts (…/agent-trial/textstats.py); the report to Claude keeps them whole
+  const shortPaths = (t: string) =>
+    t.replace(/(?:~|\/)[^\s;()'"]*\/[^\s;()'"]+/g, m => {
+      const parts = m.split('/')
+      return m.length > 40 && parts.length > 3 ? `…/${parts.slice(-2).join('/')}` : m
+    })
   const oneLine = (t: string, max = 80) => {
-    const l = t.replace(/\s+/g, ' ').trim()
+    const l = shortPaths(t).replace(/\s+/g, ' ').trim()
     return l.length > max ? `${l.slice(0, max - 1)}…` : l
   }
   io.log(ui.agentStart(oneLine(task)))
@@ -1392,7 +1499,7 @@ Cost: $0.75 per 1,000 successful searches and per 1,000 page reads, plus tokens.
 Inside, DeepSeek has glob, grep, read_file, write_file, edit_file, run, web_search and web_fetch. Reads and writes follow Claude Code's permissions like files/output_path.
 Web: DeepSeek's own search (up to ${AGENT_MAX_SEARCHES} searches and ${AGENT_MAX_FETCHES} page reads per task, billed per request); web_fetch only opens URLs from its search results or written in the task.
 Everything DeepSeek reads (files, output, pages) is wrapped in a random boundary and marked as material, not instructions.
-Its grep and glob run through Claude Code's own Grep and Glob tools. A command runs at once if the user's permission rules allow it, or if the user approved it for this project before; otherwise the user is asked in a dialog (allow for this run, always allow here, or deny). Deny rules always win.
+Its grep and glob run through Claude Code's own Grep and Glob tools, or, in a session without them, through the plugin's own search with the same permission checks per file. A command runs at once if the user's permission rules allow it, or if the user approved it for this project before; otherwise the user is asked in a dialog (allow for this run, always allow here, or deny). Deny rules always win.
 task: the goal, scope and what done means. files: files to put in front from the start (saves exploring).
 check_command: a command that verifies the work, such as a test command. DeepSeek runs it before finishing, and the plugin runs it again at the end unless nothing changed since DeepSeek's last run of it. Always give one. If the result says it was not run, run it yourself.
 max_turns: turn limit (1-${AGENT_MAX_TURNS}, default ${AGENT_DEFAULT_TURNS}). A run also stops at ${AGENT_MAX_INPUT_TOKENS} input tokens.
@@ -1456,6 +1563,7 @@ function makeIO($: EngineInterface, langOption: unknown): IO {
     },
     lang: () => langOf($, langOption),
     log: text => $.ui.log(text),
+    list: path => $.fs.list(path).then(es => es.map(e => ({ name: e.name, kind: e.kind, size: e.size, isLink: e.isLink }))),
     status: text => $.ui.status(text),
     env: async name => {
       switch (name) {
